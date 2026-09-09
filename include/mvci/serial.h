@@ -21,7 +21,7 @@
  *   connect       0d 00 07 <proto u32><flags u32><baud u32>
  *   start filter  10 00 0b <proto u32><msgid u32><type u32><mask><pattern>
  *   set config    0e 00 0e 02 04 00 00 00 <param u32><value u32>
- *   clear periodic 06 00 0e 09 04 00 00 00
+ *   clear periodic 06 00 0e 09 <proto u32>
  *   fast init     0a 00 0e 05 04 00 00 00 <init bytes>
  *   write msg     0e 00 0a 04 00 00 00 00 00 00 00 <msg bytes>
  *   read poll     05 00 09 04 00 00 00 00
@@ -59,7 +59,7 @@ int mvci_inner_set_config(uint32_t param, uint32_t value, uint8_t *inner);
 int mvci_inner_connect(uint32_t proto, uint32_t flags, uint32_t baud, uint8_t *inner);
 int mvci_inner_start_filter(uint32_t proto, uint32_t msgid, uint32_t type,
                             uint8_t mask, uint8_t pattern, uint8_t *inner);
-int mvci_inner_clear_periodic(uint8_t *inner);
+int mvci_inner_clear_periodic(uint32_t proto, uint8_t *inner);
 int mvci_inner_fast_init(uint32_t proto, const uint8_t *init, size_t n, uint8_t *inner);
 int mvci_inner_write_msg(uint32_t proto, const uint8_t *msg, size_t n, uint8_t *inner);
 int mvci_inner_read_poll(uint8_t *inner);
@@ -89,7 +89,9 @@ int mvci_transact(mvci_ctx_t *ctx, const uint8_t *inner, size_t inner_len,
 int  mvci_start_keepalive(mvci_ctx_t *ctx);
 void mvci_stop_keepalive(mvci_ctx_t *ctx);
 
-/* J2534 operations (ISO14230) */
+/* J2534 operations. mvci_connect records the ProtocolID; every later command
+ * carries that same ProtocolID, so a channel opened as ISO9141 is not written
+ * to with ISO14230 command bodies. */
 int mvci_connect(mvci_ctx_t *ctx, uint32_t proto, uint32_t flags, uint32_t baud);
 int mvci_disconnect(mvci_ctx_t *ctx);
 int mvci_start_filter(mvci_ctx_t *ctx, uint32_t msgid, uint8_t mask, uint8_t pattern);

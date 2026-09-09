@@ -109,10 +109,11 @@ int mvci_inner_start_filter(uint32_t proto, uint32_t msgid, uint32_t type,
     return 17;
 }
 
-int mvci_inner_clear_periodic(uint8_t *inner)
+int mvci_inner_clear_periodic(uint32_t proto, uint8_t *inner)
 {
-    static const uint8_t b[8] = { 0x06, 0x00, 0x0e, 0x09, 0x04, 0x00, 0x00, 0x00 };
-    memcpy(inner, b, 8);
+    static const uint8_t b[4] = { 0x06, 0x00, 0x0e, 0x09 };
+    memcpy(inner, b, 4);
+    put_u32(inner + 4, proto);
     return 8;
 }
 
@@ -158,10 +159,13 @@ int mvci_parse_read_reply(const uint8_t *inner, int inner_len,
  *  Session
  * ====================================================================== */
 
+#define MVCI_ISO14230 4
+
 struct mvci_ctx {
     mvci_io_t       *io;
     int              have_key;
     uint8_t          key[8];
+    uint32_t         proto;      /* J2534 ProtocolID of the connected channel */
     mvci_mutex_t     lock;       /* serialises device I/O */
     mvci_thread_t    ka_thread;
     volatile int     ka_run;
@@ -188,6 +192,7 @@ mvci_ctx_t *mvci_open(const char *port)
     if (!ctx) return NULL;
     ctx->io = mvci_io_open(port);
     if (!ctx->io) { free(ctx); return NULL; }
+    ctx->proto = MVCI_ISO14230;      /* until PassThruConnect selects one */
     mvci_mutex_init(&ctx->lock);
     return ctx;
 }
@@ -321,8 +326,6 @@ void mvci_stop_keepalive(mvci_ctx_t *ctx)
 
 /* ---- higher level J2534 operations ---------------------------------- */
 
-#define MVCI_ISO14230 4
-
 int mvci_connect(mvci_ctx_t *ctx, uint32_t proto, uint32_t flags, uint32_t baud)
 {
     uint8_t in[32], resp[64];
@@ -338,6 +341,7 @@ int mvci_connect(mvci_ctx_t *ctx, uint32_t proto, uint32_t flags, uint32_t baud)
         r = transact_locked(ctx, in, n, resp, sizeof resp, 2000);
         ok = (r >= 3 && resp[0] == 0x02 && resp[2] == 0x07);
     }
+    if (ok) ctx->proto = proto;
     mvci_mutex_unlock(&ctx->lock);
     return ok ? 0 : -1;
 }
@@ -353,7 +357,7 @@ int mvci_disconnect(mvci_ctx_t *ctx)
 int mvci_start_filter(mvci_ctx_t *ctx, uint32_t msgid, uint8_t mask, uint8_t pattern)
 {
     uint8_t in[32], resp[64];
-    int n = mvci_inner_start_filter(MVCI_ISO14230, msgid, 1 /*PASS*/, mask, pattern, in);
+    int n = mvci_inner_start_filter(ctx->proto, msgid, 1 /*PASS*/, mask, pattern, in);
     int r = mvci_transact(ctx, in, n, resp, sizeof resp, 2000);
     return (r >= 3 && resp[0] == 0x02 && resp[2] == 0x0b) ? 0 : -1;
 }
@@ -369,7 +373,7 @@ int mvci_set_config(mvci_ctx_t *ctx, uint32_t param, uint32_t value)
 int mvci_clear_periodic(mvci_ctx_t *ctx)
 {
     uint8_t in[8], resp[64];
-    int n = mvci_inner_clear_periodic(in);
+    int n = mvci_inner_clear_periodic(ctx->proto, in);
     int r = mvci_transact(ctx, in, n, resp, sizeof resp, 1000);
     return (r >= 3 && resp[0] == 0x02 && resp[2] == 0x0e) ? 0 : -1;
 }
@@ -378,7 +382,7 @@ int mvci_fast_init(mvci_ctx_t *ctx, const uint8_t *init, size_t n,
                    uint8_t *resp_out, size_t cap)
 {
     uint8_t in[32], resp[64];
-    int ilen = mvci_inner_fast_init(MVCI_ISO14230, init, n, in);
+    int ilen = mvci_inner_fast_init(ctx->proto, init, n, in);
     int r = mvci_transact(ctx, in, ilen, resp, sizeof resp, 3000);
     if (r < 3 || resp[2] != 0x0e) return -1;
     int mlen = (int)resp[0] - 1;                 /* 08 -> 7 ECU key bytes @ off 3 */
@@ -391,7 +395,7 @@ int mvci_fast_init(mvci_ctx_t *ctx, const uint8_t *init, size_t n,
 int mvci_write_msg(mvci_ctx_t *ctx, const uint8_t *msg, size_t n)
 {
     uint8_t in[32], resp[64];
-    int ilen = mvci_inner_write_msg(MVCI_ISO14230, msg, n, in);
+    int ilen = mvci_inner_write_msg(ctx->proto, msg, n, in);
     int r = mvci_transact(ctx, in, ilen, resp, sizeof resp, 1000);
     return r > 0 ? 0 : -1;
 }

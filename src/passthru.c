@@ -23,6 +23,14 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* The J2534 ABI is fixed width. A host binds these entry points with 32-bit
+ * scalars, so a 64-bit scalar here would overrun every out-parameter. Fail the
+ * build rather than the vehicle session. */
+_Static_assert(sizeof(J2534_ULONG) == 4, "J2534 scalars must be 32-bit");
+_Static_assert(sizeof(J2534_LONG) == 4, "J2534 status must be 32-bit");
+_Static_assert(sizeof(PASSTHRU_MSG) == 4152, "PASSTHRU_MSG must be 4152 bytes");
+_Static_assert(sizeof(SCONFIG) == 8, "SCONFIG must be 8 bytes");
+
 #define MAX_SLOTS   4
 
 typedef struct {
@@ -46,18 +54,18 @@ static void ensure_init(void)
 static void set_err(const char *s) { strncpy(g_last_error, s, sizeof g_last_error - 1); }
 
 /* device/channel/filter id encoding: dev = slot+1, channel = slot+0x100 */
-#define DEV_ID(s)         ((unsigned long)((s) + 1))
-#define CH_ID(s)          ((unsigned long)((s) + 0x100))
+#define DEV_ID(s)         ((J2534_ULONG)((s) + 1))
+#define CH_ID(s)          ((J2534_ULONG)((s) + 0x100))
 #define SLOT_FROM_DEV(id) ((int)(id) - 1)
 #define SLOT_FROM_CH(id)  ((int)(id) - 0x100)
 
-static slot_t *dev_slot(unsigned long id)
+static slot_t *dev_slot(J2534_ULONG id)
 {
     int i = SLOT_FROM_DEV(id);
     if (i < 0 || i >= MAX_SLOTS || !g_slot[i].open) return NULL;
     return &g_slot[i];
 }
-static slot_t *ch_slot(unsigned long id)
+static slot_t *ch_slot(J2534_ULONG id)
 {
     int i = SLOT_FROM_CH(id);
     if (i < 0 || i >= MAX_SLOTS || !g_slot[i].open) return NULL;
@@ -84,7 +92,7 @@ static const char *default_port(void *pName)
 
 /* ====================================================================== */
 
-long J2534_API PassThruOpen(void *pName, unsigned long *pDeviceID)
+J2534_LONG J2534_API PassThruOpen(void *pName, J2534_ULONG *pDeviceID)
 {
     ensure_init();
     if (!pDeviceID) { set_err("NULL pDeviceID"); return ERR_NULL_PARAMETER; }
@@ -113,7 +121,7 @@ long J2534_API PassThruOpen(void *pName, unsigned long *pDeviceID)
     return STATUS_NOERROR;
 }
 
-long J2534_API PassThruClose(unsigned long DeviceID)
+J2534_LONG J2534_API PassThruClose(J2534_ULONG DeviceID)
 {
     ensure_init();
     mvci_mutex_lock(&g_lock);
@@ -126,9 +134,9 @@ long J2534_API PassThruClose(unsigned long DeviceID)
     return STATUS_NOERROR;
 }
 
-long J2534_API PassThruConnect(unsigned long DeviceID, unsigned long ProtocolID,
-                               unsigned long Flags, unsigned long BaudRate,
-                               unsigned long *pChannelID)
+J2534_LONG J2534_API PassThruConnect(J2534_ULONG DeviceID, J2534_ULONG ProtocolID,
+                               J2534_ULONG Flags, J2534_ULONG BaudRate,
+                               J2534_ULONG *pChannelID)
 {
     ensure_init();
     slot_t *s = dev_slot(DeviceID);
@@ -145,7 +153,7 @@ long J2534_API PassThruConnect(unsigned long DeviceID, unsigned long ProtocolID,
     return STATUS_NOERROR;
 }
 
-long J2534_API PassThruDisconnect(unsigned long ChannelID)
+J2534_LONG J2534_API PassThruDisconnect(J2534_ULONG ChannelID)
 {
     ensure_init();
     slot_t *s = ch_slot(ChannelID);
@@ -157,9 +165,9 @@ long J2534_API PassThruDisconnect(unsigned long ChannelID)
     return STATUS_NOERROR;
 }
 
-long J2534_API PassThruStartMsgFilter(unsigned long ChannelID, unsigned long FilterType,
+J2534_LONG J2534_API PassThruStartMsgFilter(J2534_ULONG ChannelID, J2534_ULONG FilterType,
                                       PASSTHRU_MSG *pMaskMsg, PASSTHRU_MSG *pPatternMsg,
-                                      PASSTHRU_MSG *pFlowControlMsg, unsigned long *pFilterID)
+                                      PASSTHRU_MSG *pFlowControlMsg, J2534_ULONG *pFilterID)
 {
     ensure_init();
     (void)FilterType; (void)pFlowControlMsg;
@@ -179,7 +187,7 @@ long J2534_API PassThruStartMsgFilter(unsigned long ChannelID, unsigned long Fil
     return STATUS_NOERROR;
 }
 
-long J2534_API PassThruStopMsgFilter(unsigned long ChannelID, unsigned long FilterID)
+J2534_LONG J2534_API PassThruStopMsgFilter(J2534_ULONG ChannelID, J2534_ULONG FilterID)
 {
     ensure_init();
     (void)FilterID;
@@ -188,8 +196,8 @@ long J2534_API PassThruStopMsgFilter(unsigned long ChannelID, unsigned long Filt
     return STATUS_NOERROR;                            /* device clears on disconnect */
 }
 
-long J2534_API PassThruWriteMsgs(unsigned long ChannelID, PASSTHRU_MSG *pMsg,
-                                 unsigned long *pNumMsgs, unsigned long TimeInterval)
+J2534_LONG J2534_API PassThruWriteMsgs(J2534_ULONG ChannelID, PASSTHRU_MSG *pMsg,
+                                 J2534_ULONG *pNumMsgs, J2534_ULONG TimeInterval)
 {
     ensure_init();
     (void)TimeInterval;
@@ -206,15 +214,15 @@ long J2534_API PassThruWriteMsgs(unsigned long ChannelID, PASSTHRU_MSG *pMsg,
     return STATUS_NOERROR;
 }
 
-long J2534_API PassThruReadMsgs(unsigned long ChannelID, PASSTHRU_MSG *pMsg,
-                                unsigned long *pNumMsgs, unsigned long Timeout)
+J2534_LONG J2534_API PassThruReadMsgs(J2534_ULONG ChannelID, PASSTHRU_MSG *pMsg,
+                                J2534_ULONG *pNumMsgs, J2534_ULONG Timeout)
 {
     ensure_init();
     slot_t *s = ch_slot(ChannelID);
     if (!s || !s->connected) { set_err("invalid channel id"); return ERR_INVALID_CHANNEL_ID; }
     if (!pMsg || !pNumMsgs || *pNumMsgs == 0) { set_err("NULL/empty msg"); return ERR_NULL_PARAMETER; }
 
-    unsigned long want = *pNumMsgs, got = 0;
+    J2534_ULONG want = *pNumMsgs, got = 0;
     uint32_t deadline = mvci_now_ms() + (uint32_t)(Timeout ? Timeout : 1);
 
     while (got < want) {
@@ -239,7 +247,7 @@ long J2534_API PassThruReadMsgs(unsigned long ChannelID, PASSTHRU_MSG *pMsg,
     return STATUS_NOERROR;
 }
 
-long J2534_API PassThruIoctl(unsigned long ChannelID, unsigned long IoctlID,
+J2534_LONG J2534_API PassThruIoctl(J2534_ULONG ChannelID, J2534_ULONG IoctlID,
                              void *pInput, void *pOutput)
 {
     ensure_init();
@@ -290,18 +298,18 @@ long J2534_API PassThruIoctl(unsigned long ChannelID, unsigned long IoctlID,
 
 /* ---- stubs / informational ------------------------------------------ */
 
-long J2534_API PassThruStartPeriodicMsg(unsigned long ChannelID, PASSTHRU_MSG *pMsg,
-                                        unsigned long *pMsgID, unsigned long TimeInterval)
+J2534_LONG J2534_API PassThruStartPeriodicMsg(J2534_ULONG ChannelID, PASSTHRU_MSG *pMsg,
+                                        J2534_ULONG *pMsgID, J2534_ULONG TimeInterval)
 { (void)ChannelID;(void)pMsg;(void)pMsgID;(void)TimeInterval; return ERR_NOT_SUPPORTED; }
 
-long J2534_API PassThruStopPeriodicMsg(unsigned long ChannelID, unsigned long MsgID)
+J2534_LONG J2534_API PassThruStopPeriodicMsg(J2534_ULONG ChannelID, J2534_ULONG MsgID)
 { (void)ChannelID;(void)MsgID; return ERR_NOT_SUPPORTED; }
 
-long J2534_API PassThruSetProgrammingVoltage(unsigned long DeviceID, unsigned long PinNumber,
-                                             unsigned long Voltage)
+J2534_LONG J2534_API PassThruSetProgrammingVoltage(J2534_ULONG DeviceID, J2534_ULONG PinNumber,
+                                             J2534_ULONG Voltage)
 { (void)DeviceID;(void)PinNumber;(void)Voltage; return ERR_NOT_SUPPORTED; }
 
-long J2534_API PassThruReadVersion(unsigned long DeviceID, char *pFirmwareVersion,
+J2534_LONG J2534_API PassThruReadVersion(J2534_ULONG DeviceID, char *pFirmwareVersion,
                                    char *pDllVersion, char *pApiVersion)
 {
     ensure_init();
@@ -314,7 +322,7 @@ long J2534_API PassThruReadVersion(unsigned long DeviceID, char *pFirmwareVersio
     return STATUS_NOERROR;
 }
 
-long J2534_API PassThruGetLastError(char *pErrorDescription)
+J2534_LONG J2534_API PassThruGetLastError(char *pErrorDescription)
 {
     if (!pErrorDescription) return ERR_NULL_PARAMETER;
     strcpy(pErrorDescription, g_last_error);
