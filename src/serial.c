@@ -385,6 +385,15 @@ int mvci_fast_init(mvci_ctx_t *ctx, const uint8_t *init, size_t n,
     int ilen = mvci_inner_fast_init(ctx->proto, init, n, in);
     int r = mvci_transact(ctx, in, ilen, resp, sizeof resp, 3000);
     if (r < 3 || resp[2] != 0x0e) return -1;
+    /* Two reply shapes arrive here. A message reply (ILEN 0x08) carries the ECU
+     * key bytes. A status reply (ILEN 0x02) is only the device acknowledging the
+     * command; the ECU said nothing. Returning a slice of the status reply as if
+     * it were an ECU answer makes a silent bus look like a live one, so report
+     * zero bytes instead. */
+    if (resp[0] == 0x02) {
+        dbg_hex("fast init: status reply, no ECU key bytes:", resp, r);
+        return 0;
+    }
     int mlen = (int)resp[0] - 1;                 /* 08 -> 7 ECU key bytes @ off 3 */
     if (mlen < 0 || 3 + mlen > r) mlen = (r > 3) ? r - 3 : 0;
     if ((size_t)mlen > cap) mlen = (int)cap;
@@ -397,7 +406,11 @@ int mvci_write_msg(mvci_ctx_t *ctx, const uint8_t *msg, size_t n)
     uint8_t in[32], resp[64];
     int ilen = mvci_inner_write_msg(ctx->proto, msg, n, in);
     int r = mvci_transact(ctx, in, ilen, resp, sizeof resp, 1000);
-    return r > 0 ? 0 : -1;
+    /* PROTOCOL.md 5.1 documents the write reply as status 02 00 0A. Every other
+     * command here validates its status reply the same way. Accepting any reply
+     * at all reported success for a write the device had rejected, so a caller
+     * could not tell a transmitted frame from a refused one. */
+    return (r >= 3 && resp[0] == 0x02 && resp[2] == 0x0a) ? 0 : -1;
 }
 
 int mvci_poll(mvci_ctx_t *ctx, uint8_t *msg_out, size_t cap,
