@@ -37,6 +37,10 @@ same wire protocol.
 - ✅ **ISO14230 / KWP2000 (K‑line)** — connect, message filters, `SET_CONFIG`,
   fast‑init, and OBD request/response are implemented and tested on a vehicle
   (live PID reads; works as a J2534 provider for Toyota Techstream over K‑line).
+- ✅ **ISO9141 Corolla adapter-only parity** — `SET_CONFIG` uses the connected id,
+  `FIVE_BAUD_INIT`, Pin 15 `SHORT_TO_GROUND`, and Corolla `FAST_INIT` match
+  captured Mini-VCI frames; OBD-disconnected failures map to J2534 errors 8/9.
+  No live five-baud success is claimed.
 - ⬜ **ISO15765 / CAN** — not yet implemented. CAN ECUs are not yet reachable.
 - The wire framing (DES‑based) and session handling are fully implemented and
   identical across all platforms; only the protocol/transport/crypto *backends*

@@ -20,10 +20,13 @@
  * Inner command bodies (decrypted):
  *   connect       0d 00 07 <proto u32><flags u32><baud u32>
  *   start filter  10 00 0b <proto u32><msgid u32><type u32><mask><pattern>
- *   set config    0e 00 0e 02 04 00 00 00 <param u32><value u32>
+ *   stop filter   09 00 0c <proto u32><msgid u32>
+ *   set config    0e 00 0e 02 <proto u32><param u32><value u32>
  *   clear periodic 06 00 0e 09 <proto u32>
- *   fast init     0a 00 0e 05 04 00 00 00 <init bytes>
- *   write msg     0e 00 0a 04 00 00 00 00 00 00 00 <msg bytes>
+ *   fast init     ILEN 00 0e 05 <proto u32><init bytes>
+ *   five-baud     ILEN 00 0e 04 <proto u32><address bytes>
+ *   prog voltage  09 00 0d <pin u32><voltage u32>
+ *   write msg     0e 00 0a <proto u32>00 00 00 00 <msg bytes>
  *   read poll     05 00 09 04 00 00 00 00
  *   keepalive     05 00 09 06 00 00 00 00
  *   disconnect    01 00 02 00 00 00 00 00
@@ -55,14 +58,26 @@ int mvci_frame_payload(const uint8_t *frame, size_t frame_len, const uint8_t **p
 int mvci_frame_decrypt(const uint8_t key[8], const uint8_t *frame, size_t frame_len,
                        uint8_t *inner_out, size_t inner_cap);
 
-int mvci_inner_set_config(uint32_t param, uint32_t value, uint8_t *inner);
+int mvci_inner_set_config(uint32_t proto, uint32_t param, uint32_t value, uint8_t *inner);
 int mvci_inner_connect(uint32_t proto, uint32_t flags, uint32_t baud, uint8_t *inner);
 int mvci_inner_start_filter(uint32_t proto, uint32_t msgid, uint32_t type,
                             uint8_t mask, uint8_t pattern, uint8_t *inner);
+int mvci_inner_stop_filter(uint32_t proto, uint32_t msgid, uint8_t *inner);
 int mvci_inner_clear_periodic(uint32_t proto, uint8_t *inner);
 int mvci_inner_fast_init(uint32_t proto, const uint8_t *init, size_t n, uint8_t *inner);
+int mvci_inner_five_baud_init(uint32_t proto, const uint8_t *addr, size_t naddr, uint8_t *inner);
+int mvci_inner_prog_voltage(uint32_t pin, uint32_t voltage, uint8_t *inner);
 int mvci_inner_write_msg(uint32_t proto, const uint8_t *msg, size_t n, uint8_t *inner);
 int mvci_inner_read_poll(uint8_t *inner);
+
+/* Pure reply classifiers for the evidenced adapter-only failures. Return 1
+ * for the exact captured bytes, 0 otherwise. No other status meaning is
+ * proven. */
+int mvci_five_baud_is_disconnected(const uint8_t *resp, int r);
+int mvci_fast_init_is_timeout(const uint8_t *resp, int r);
+/* Pure programming-voltage gate. Returns 1 only for Pin 15 SHORT_TO_GROUND
+ * (0xFFFFFFFE). All other pin/value pairs must stay unsupported. */
+int mvci_prog_voltage_is_supported(uint32_t pin, uint32_t voltage);
 
 /* Parse a decrypted reply. Returns message length (>0) with the message copied
  * to msg_out for echo/data replies, 0 for a status reply with no message, or -1.
@@ -85,7 +100,10 @@ const uint8_t *mvci_key(const mvci_ctx_t *ctx);
 int mvci_transact(mvci_ctx_t *ctx, const uint8_t *inner, size_t inner_len,
                   uint8_t *resp_inner, size_t resp_cap, int timeout_ms);
 
-/* background keepalive thread (05 00 09 06 ...) — start after handshake */
+/* Keepalive (05 00 09 06 ...) is explicit opt-in only. The J2534 provider
+ * path never starts it: T254/T255 prove the adapter tolerates multi-second
+ * idle with no keepalive traffic, and autonomous traffic between
+ * characterized calls would break provider sequence parity. */
 int  mvci_start_keepalive(mvci_ctx_t *ctx);
 void mvci_stop_keepalive(mvci_ctx_t *ctx);
 
@@ -95,8 +113,20 @@ void mvci_stop_keepalive(mvci_ctx_t *ctx);
 int mvci_connect(mvci_ctx_t *ctx, uint32_t proto, uint32_t flags, uint32_t baud);
 int mvci_disconnect(mvci_ctx_t *ctx);
 int mvci_start_filter(mvci_ctx_t *ctx, uint32_t msgid, uint8_t mask, uint8_t pattern);
+int mvci_stop_filter(mvci_ctx_t *ctx, uint32_t msgid);
 int mvci_set_config(mvci_ctx_t *ctx, uint32_t param, uint32_t value);
+int mvci_set_prog_voltage(mvci_ctx_t *ctx, uint32_t pin, uint32_t voltage);
 int mvci_clear_periodic(mvci_ctx_t *ctx);
+/* Five-baud init. Returns key byte count (>=0), MVCI_FB_NOT_CONNECTED (-2)
+ * for the evidenced OBD-disconnected status reply, or -1 for any other
+ * failure. No success wire shape is proven, so any other reply fails closed. */
+int mvci_five_baud_init(mvci_ctx_t *ctx, const uint8_t *addr, size_t naddr,
+                        uint8_t *out, size_t cap);
+#define MVCI_FB_NOT_CONNECTED (-2)
+#define MVCI_FI_TIMEOUT (-2)
+/* Fast init. Returns ECU key byte count (>=0), MVCI_FI_TIMEOUT (-2) for the
+ * evidenced OBD-disconnected status reply, or -1 for any other failure.
+ * Unknown status replies fail closed. */
 int mvci_fast_init(mvci_ctx_t *ctx, const uint8_t *init, size_t n,
                    uint8_t *resp_out, size_t cap);
 int mvci_keepalive(mvci_ctx_t *ctx);
