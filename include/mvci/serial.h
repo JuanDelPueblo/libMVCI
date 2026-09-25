@@ -20,6 +20,7 @@
  * Inner command bodies (decrypted):
  *   connect       0d 00 07 <proto u32><flags u32><baud u32>
  *   start filter  10 00 0b <proto u32><msgid u32><type u32><mask><pattern>
+ *   stop filter   09 00 0c <proto u32><msgid u32>
  *   set config    0e 00 0e 02 <proto u32><param u32><value u32>
  *   clear periodic 06 00 0e 09 <proto u32>
  *   fast init     ILEN 00 0e 05 <proto u32><init bytes>
@@ -61,6 +62,7 @@ int mvci_inner_set_config(uint32_t proto, uint32_t param, uint32_t value, uint8_
 int mvci_inner_connect(uint32_t proto, uint32_t flags, uint32_t baud, uint8_t *inner);
 int mvci_inner_start_filter(uint32_t proto, uint32_t msgid, uint32_t type,
                             uint8_t mask, uint8_t pattern, uint8_t *inner);
+int mvci_inner_stop_filter(uint32_t proto, uint32_t msgid, uint8_t *inner);
 int mvci_inner_clear_periodic(uint32_t proto, uint8_t *inner);
 int mvci_inner_fast_init(uint32_t proto, const uint8_t *init, size_t n, uint8_t *inner);
 int mvci_inner_five_baud_init(uint32_t proto, const uint8_t *addr, size_t naddr, uint8_t *inner);
@@ -98,7 +100,10 @@ const uint8_t *mvci_key(const mvci_ctx_t *ctx);
 int mvci_transact(mvci_ctx_t *ctx, const uint8_t *inner, size_t inner_len,
                   uint8_t *resp_inner, size_t resp_cap, int timeout_ms);
 
-/* background keepalive thread (05 00 09 06 ...) — start after handshake */
+/* Keepalive (05 00 09 06 ...) is explicit opt-in only. The J2534 provider
+ * path never starts it: T254/T255 prove the adapter tolerates multi-second
+ * idle with no keepalive traffic, and autonomous traffic between
+ * characterized calls would break provider sequence parity. */
 int  mvci_start_keepalive(mvci_ctx_t *ctx);
 void mvci_stop_keepalive(mvci_ctx_t *ctx);
 
@@ -108,6 +113,7 @@ void mvci_stop_keepalive(mvci_ctx_t *ctx);
 int mvci_connect(mvci_ctx_t *ctx, uint32_t proto, uint32_t flags, uint32_t baud);
 int mvci_disconnect(mvci_ctx_t *ctx);
 int mvci_start_filter(mvci_ctx_t *ctx, uint32_t msgid, uint8_t mask, uint8_t pattern);
+int mvci_stop_filter(mvci_ctx_t *ctx, uint32_t msgid);
 int mvci_set_config(mvci_ctx_t *ctx, uint32_t param, uint32_t value);
 int mvci_set_prog_voltage(mvci_ctx_t *ctx, uint32_t pin, uint32_t voltage);
 int mvci_clear_periodic(mvci_ctx_t *ctx);

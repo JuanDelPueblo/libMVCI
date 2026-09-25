@@ -119,6 +119,7 @@ int mvci_inner_clear_periodic(uint32_t proto, uint8_t *inner)
 
 int mvci_inner_fast_init(uint32_t proto, const uint8_t *init, size_t n, uint8_t *inner)
 {
+    if (n > MVCI_MAX_INNER - 8) return -1;
     inner[0] = (uint8_t)(5 + 1 + n);
     inner[1] = 0x00; inner[2] = 0x0e; inner[3] = 0x05;
     put_u32(inner + 4, proto);
@@ -144,8 +145,20 @@ int mvci_inner_prog_voltage(uint32_t pin, uint32_t voltage, uint8_t *inner)
     return 11;
 }
 
+/* Stop message filter. Wire shape is vendor-evidenced (T255 frames 504/522):
+ * ILEN 00 0C [proto u32] [msgid u32], where msgid is the handle the earlier
+ * start-filter command carried. */
+int mvci_inner_stop_filter(uint32_t proto, uint32_t msgid, uint8_t *inner)
+{
+    inner[0] = 0x09; inner[1] = 0x00; inner[2] = 0x0c;
+    put_u32(inner + 3, proto);
+    put_u32(inner + 7, msgid);
+    return 11;
+}
+
 int mvci_inner_write_msg(uint32_t proto, const uint8_t *msg, size_t n, uint8_t *inner)
 {
+    if (n > MVCI_MAX_INNER - 11) return -1;
     inner[0] = (uint8_t)(1 + 8 + n);
     inner[1] = 0x00; inner[2] = 0x0a;
     put_u32(inner + 3, proto);
@@ -386,9 +399,29 @@ int mvci_connect(mvci_ctx_t *ctx, uint32_t proto, uint32_t flags, uint32_t baud)
 int mvci_disconnect(mvci_ctx_t *ctx)
 {
     static const uint8_t in[8] = { 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00 };
-    uint8_t resp[32];
-    int r = mvci_transact(ctx, in, sizeof in, resp, sizeof resp, 1000);
-    return r > 0 ? 0 : -1;
+    /* The device answers Disconnect in plaintext (T254 frame 922 / T255
+     * frame 560: 07 00 02 00 02 00 07), which is not DES-decryptable, so a
+     * normal transact cannot read it. Validate the raw bytes exactly. */
+    static const uint8_t exp[7] = { 0x07, 0x00, 0x02, 0x00, 0x02, 0x00, 0x07 };
+    uint8_t frame[MVCI_MAX_FRAME], rx[sizeof exp];
+    int n = mvci_frame_enc(ctx->key, in, sizeof in, frame, sizeof frame);
+    if (!ctx->have_key || n < 0) return -1;
+    mvci_mutex_lock(&ctx->lock);
+    mvci_io_purge_rx(ctx->io);
+    int ok = -1;
+    if (mvci_io_write(ctx->io, frame, n) == n) {
+        int got = 0;
+        uint32_t deadline = mvci_now_ms() + 1000;
+        while (got < (int)sizeof exp && (int32_t)(deadline - mvci_now_ms()) > 0) {
+            int r = mvci_io_read(ctx->io, rx + got, (int)sizeof exp - got, 200);
+            if (r < 0) break;
+            if (r > 0) got += r;
+            else mvci_sleep_ms(1);
+        }
+        if (got == (int)sizeof exp && memcmp(rx, exp, sizeof exp) == 0) ok = 0;
+    }
+    mvci_mutex_unlock(&ctx->lock);
+    return ok;
 }
 
 int mvci_start_filter(mvci_ctx_t *ctx, uint32_t msgid, uint8_t mask, uint8_t pattern)
@@ -397,6 +430,14 @@ int mvci_start_filter(mvci_ctx_t *ctx, uint32_t msgid, uint8_t mask, uint8_t pat
     int n = mvci_inner_start_filter(ctx->proto, msgid, 1 /*PASS*/, mask, pattern, in);
     int r = mvci_transact(ctx, in, n, resp, sizeof resp, 2000);
     return (r >= 3 && resp[0] == 0x02 && resp[2] == 0x0b) ? 0 : -1;
+}
+
+int mvci_stop_filter(mvci_ctx_t *ctx, uint32_t msgid)
+{
+    uint8_t in[16], resp[64];
+    int n = mvci_inner_stop_filter(ctx->proto, msgid, in);
+    int r = mvci_transact(ctx, in, n, resp, sizeof resp, 2000);
+    return (r >= 3 && resp[0] == 0x02 && resp[2] == 0x0c) ? 0 : -1;
 }
 
 int mvci_set_config(mvci_ctx_t *ctx, uint32_t param, uint32_t value)
@@ -420,7 +461,9 @@ int mvci_five_baud_init(mvci_ctx_t *ctx, const uint8_t *addr, size_t naddr,
                         uint8_t *out, size_t cap)
 {
     (void)out; (void)cap;
-    uint8_t in[32], resp[64];
+    /* Sized for the constructor's full accepted range (8 + up to 248 address
+     * bytes), so an in-range input can never overrun this buffer. */
+    uint8_t in[MVCI_MAX_INNER], resp[64];
     int ilen = mvci_inner_five_baud_init(ctx->proto, addr, naddr, in);
     if (ilen < 0) return -1;
     mvci_sleep_ms(2000);
@@ -440,8 +483,9 @@ int mvci_clear_periodic(mvci_ctx_t *ctx)
 int mvci_fast_init(mvci_ctx_t *ctx, const uint8_t *init, size_t n,
                    uint8_t *resp_out, size_t cap)
 {
-    uint8_t in[32], resp[64];
+    uint8_t in[MVCI_MAX_INNER], resp[64];
     int ilen = mvci_inner_fast_init(ctx->proto, init, n, in);
+    if (ilen < 0) return -1;
     int r = mvci_transact(ctx, in, ilen, resp, sizeof resp, 3000);
     if (r < 3 || resp[2] != 0x0e) return -1;
     if (mvci_fast_init_is_timeout(resp, r)) return MVCI_FI_TIMEOUT;
@@ -458,8 +502,9 @@ int mvci_fast_init(mvci_ctx_t *ctx, const uint8_t *init, size_t n,
 
 int mvci_write_msg(mvci_ctx_t *ctx, const uint8_t *msg, size_t n)
 {
-    uint8_t in[32], resp[64];
+    uint8_t in[MVCI_MAX_INNER], resp[64];
     int ilen = mvci_inner_write_msg(ctx->proto, msg, n, in);
+    if (ilen < 0) return -1;
     int r = mvci_transact(ctx, in, ilen, resp, sizeof resp, 1000);
     /* PROTOCOL.md 5.1 documents the write reply as status 02 00 0A. Every other
      * command here validates its status reply the same way. Accepting any reply

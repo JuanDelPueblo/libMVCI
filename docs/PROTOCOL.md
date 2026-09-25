@@ -113,6 +113,7 @@ denotes a little‑endian field.
 |----------|--------|----------------|------------|
 | Connect | `07` | `0D 00 07` `[proto u32]` `[flags u32]` `[baud u32]` | status `02 00 07` |
 | Start message filter | `0B` | `10 00 0B` `[proto u32]` `[msgID u32]` `[type u32]` `mask(1)` `pattern(1)` | status `02 00 0B` |
+| Stop message filter | `0C` | `09 00 0C` `[proto u32]` `[msgID u32]` | status `02 00 0C` |
 | Set config (one param) | `0E`/`02` | `0E 00 0E 02` `[proto u32]` `[param u32]` `[value u32]` | status `02 00 0E` |
 | Clear periodic msgs | `0E`/`09` | `06 00 0E 09` `[proto u32]` | status `02 00 0E` |
 | Fast init | `0E`/`05` | `ILEN 00 0E 05` `[proto u32]` `init bytes…` | message reply (ECU key bytes), or status §6.3 |
@@ -209,10 +210,13 @@ Still unobserved:
 
 ## 7. Keepalive
 
-While a device is open the host must keep the adapter alive by transmitting
-periodically (≈ every 15 ms); the adapter resets if traffic stops. The dedicated
-keepalive command (§5.1) is used when idle. During an active read‑poll loop the
-poll frames themselves satisfy this requirement.
+The keepalive command (§5.1) exists, and `mvci_keepalive()` sends one on
+demand. The J2534 provider path sends no background traffic: T254 held a
+2.7 s five-baud wait and T255 held the full programming-entry sequence with
+zero keepalive commands on the wire and no adapter reset, so an autonomous
+15 ms keepalive would only add unevidenced traffic between characterized
+calls. A caller that holds a device open and idle far beyond the evidenced
+windows may call `mvci_start_keepalive()` explicitly.
 
 ## 8. Teardown
 

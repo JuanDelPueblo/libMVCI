@@ -144,6 +144,30 @@ if(MVCI_BUILD_TESTS)
 
     # No-argument run is the hardware-free codec self-test.
     add_test(NAME mvci_selftest COMMAND mvci_test)
+
+    # J2534 provider sequence-equivalence test: the real PassThru* provider
+    # against an in-memory scripted device (test/mock_io.c). Asserts the
+    # exact emitted adapter-command sequences, so any extra background
+    # traffic fails the comparison. No hardware.
+    add_executable(mvci_seq_test
+        test/mvci_seq_test.c
+        test/mock_io.c
+        src/passthru.c
+        src/serial.c
+        src/des.c)
+    target_include_directories(mvci_seq_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+    if(WIN32)
+        target_link_libraries(mvci_seq_test PRIVATE bcrypt)
+    elseif(APPLE)
+        target_link_libraries(mvci_seq_test PRIVATE Threads::Threads)
+    else()
+        target_link_libraries(mvci_seq_test PRIVATE OpenSSL::Crypto Threads::Threads)
+    endif()
+
+    add_test(NAME mvci_seqtest COMMAND mvci_seq_test)
 endif()
 
 # --------------------------------------------------------------------------

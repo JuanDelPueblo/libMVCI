@@ -32,6 +32,7 @@ _Static_assert(sizeof(PASSTHRU_MSG) == 4152, "PASSTHRU_MSG must be 4152 bytes");
 _Static_assert(sizeof(SCONFIG) == 8, "SCONFIG must be 8 bytes");
 
 #define MAX_SLOTS   4
+#define MAX_FILTERS 32
 
 typedef struct {
     int          open;
@@ -39,6 +40,7 @@ typedef struct {
     mvci_ctx_t  *ctx;
     uint32_t     proto;
     uint32_t     next_id;        /* filter/msg id generator */
+    uint32_t     filter_msg[MAX_FILTERS];  /* device msgid by (FilterID-1), 0 = free */
 } slot_t;
 
 static slot_t       g_slot[MAX_SLOTS];
@@ -110,7 +112,12 @@ J2534_LONG J2534_API PassThruOpen(void *pName, J2534_ULONG *pDeviceID)
         set_err("handshake failed");
         return ERR_DEVICE_NOT_CONNECTED;
     }
-    mvci_start_keepalive(ctx);
+    /* No background keepalive: T254/T255 prove the adapter tolerates
+     * multi-second idle with zero keepalive traffic, and an autonomous
+     * 15 ms keepalive would interleave extra adapter commands between the
+     * characterized J2534 calls (notably across the 2000 ms five-baud
+     * pre-init idle). Callers that hold a device open and idle far beyond
+     * the evidenced windows may call mvci_start_keepalive() explicitly. */
 
     g_slot[slot].open = 1;
     g_slot[slot].connected = 0;
@@ -128,7 +135,7 @@ J2534_LONG J2534_API PassThruClose(J2534_ULONG DeviceID)
     slot_t *s = dev_slot(DeviceID);
     if (!s) { mvci_mutex_unlock(&g_lock); set_err("invalid device id"); return ERR_INVALID_DEVICE_ID; }
     if (s->connected) mvci_disconnect(s->ctx);       /* session teardown (01 00 02) */
-    mvci_close(s->ctx);                              /* stops keepalive + closes */
+    mvci_close(s->ctx);                              /* closes (stops keepalive if one was started explicitly) */
     memset(s, 0, sizeof *s);
     mvci_mutex_unlock(&g_lock);
     return STATUS_NOERROR;
@@ -158,10 +165,13 @@ J2534_LONG J2534_API PassThruDisconnect(J2534_ULONG ChannelID)
     ensure_init();
     slot_t *s = ch_slot(ChannelID);
     if (!s || !s->connected) { set_err("invalid channel id"); return ERR_INVALID_CHANNEL_ID; }
-    /* Drop the channel only; keep the device session alive (keepalive continues)
-     * so the next PassThruConnect succeeds without re-initialising the adapter.
-     * The wire teardown (01 00 02) happens at PassThruClose. */
+    /* Real wire teardown (01 00 02). A later PassThruConnect re-runs the
+     * handshake when the device needs it (see mvci_connect), so dropping the
+     * channel here does not strand the next session. */
+    if (mvci_disconnect(s->ctx) != 0) { set_err("disconnect failed"); return ERR_FAILED; }
     s->connected = 0;
+    s->next_id = 1;
+    memset(s->filter_msg, 0, sizeof s->filter_msg);
     return STATUS_NOERROR;
 }
 
@@ -177,12 +187,14 @@ J2534_LONG J2534_API PassThruStartMsgFilter(J2534_ULONG ChannelID, J2534_ULONG F
 
     uint8_t mask    = pMaskMsg->DataSize    ? pMaskMsg->Data[0]    : 0;
     uint8_t pattern = pPatternMsg->DataSize ? pPatternMsg->Data[0] : 0;
+    if (s->next_id == 0 || s->next_id > MAX_FILTERS) { set_err("too many filters"); return ERR_FAILED; }
     uint32_t msgid  = 0x000e7a00u + (s->next_id & 0xff);    /* device-style handle */
 
     if (mvci_start_filter(s->ctx, msgid, mask, pattern) != 0) {
         set_err("start filter failed");
         return ERR_FAILED;
     }
+    s->filter_msg[s->next_id - 1] = msgid;
     *pFilterID = s->next_id++;
     return STATUS_NOERROR;
 }
@@ -190,10 +202,20 @@ J2534_LONG J2534_API PassThruStartMsgFilter(J2534_ULONG ChannelID, J2534_ULONG F
 J2534_LONG J2534_API PassThruStopMsgFilter(J2534_ULONG ChannelID, J2534_ULONG FilterID)
 {
     ensure_init();
-    (void)FilterID;
     slot_t *s = ch_slot(ChannelID);
     if (!s || !s->connected) { set_err("invalid channel id"); return ERR_INVALID_CHANNEL_ID; }
-    return STATUS_NOERROR;                            /* device clears on disconnect */
+    /* Forward the vendor-evidenced stop-filter command (T255 frames 504/522)
+     * with the same device handle the start-filter command carried. */
+    if (FilterID == 0 || FilterID > MAX_FILTERS || s->filter_msg[FilterID - 1] == 0) {
+        set_err("invalid filter id");
+        return ERR_INVALID_FILTER_ID;
+    }
+    if (mvci_stop_filter(s->ctx, s->filter_msg[FilterID - 1]) != 0) {
+        set_err("stop filter failed");
+        return ERR_FAILED;
+    }
+    s->filter_msg[FilterID - 1] = 0;
+    return STATUS_NOERROR;
 }
 
 J2534_LONG J2534_API PassThruWriteMsgs(J2534_ULONG ChannelID, PASSTHRU_MSG *pMsg,
