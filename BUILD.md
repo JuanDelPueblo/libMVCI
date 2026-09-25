@@ -168,6 +168,10 @@ opens the adapter by its USB description `"M-VCI"`. Live test:
   keepalive thread; `PassThruClose` stops it.
 - `PassThruReadMsgs` returns the device RxStatus byte unchanged (`0` = received
   data, `2` = TX echo), matching the original DLL's behaviour.
-- Only the IOCTLs the adapter implements are wired up: `SET_CONFIG`,
-  `CLEAR_PERIODIC_MSGS`, `FAST_INIT`, and the buffer/filter clears (no-ops).
-  Others return `ERR_NOT_SUPPORTED`.
+- Wired IOCTLs: `SET_CONFIG` (uses the connected protocol id), `FIVE_BAUD_INIT`
+  (adapter-only; disconnected maps to `ERR_DEVICE_NOT_CONNECTED`), `FAST_INIT`
+  (disconnected status maps to `ERR_TIMEOUT`), `CLEAR_PERIODIC_MSGS`, and the
+  buffer/filter clears (no-ops). Others return `ERR_NOT_SUPPORTED`.
+- `PassThruSetProgrammingVoltage` supports only Pin 15 `SHORT_TO_GROUND`
+  (`0xFFFFFFFE`). All other pin/value pairs return `ERR_NOT_SUPPORTED`. No
+  positive voltage exists.

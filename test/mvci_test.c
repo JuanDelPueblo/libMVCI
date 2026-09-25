@@ -15,6 +15,7 @@
  */
 
 #include <mvci/serial.h>
+#include <mvci/j2534.h>
 
 #include <stdio.h>
 #include <string.h>
@@ -81,27 +82,27 @@ static void selftest(void)
         if (ok) { g_pass++; hex("key", pl + 3, 8); } else g_fail++;
     }
 
-    /* 4. SET_CONFIG(param=7,value=0), KEY_OLD -> real wire frame */
+    /* 4. SET_CONFIG(proto=4,param=7,value=0), KEY_OLD -> real wire frame */
     {
         static const uint8_t exp[] = { 0x13,0x00,0x1a,0x7c,0xef,0xa7,0x56,0x16,0x8c,0xbc,
                                        0x3f,0x7d,0x9a,0x06,0x8e,0x58,0x87,0xe6,0x24 };
         uint8_t inner[16];
-        mvci_inner_set_config(7, 0, inner);
+        mvci_inner_set_config(4, 7, 0, inner);
         n = mvci_frame_enc(KEY_OLD, inner, sizeof inner, out, sizeof out);
         check("set_config(7,0) wire [old key]", out, n, exp, sizeof exp);
     }
 
-    /* 5. SET_CONFIG(param=7,value=1), KEY_OLD */
+    /* 5. SET_CONFIG(proto=4,param=7,value=1), KEY_OLD */
     {
         static const uint8_t exp[] = { 0x13,0x00,0x1a,0x7c,0xef,0xa7,0x56,0x16,0x8c,0xbc,
                                        0x0a,0xbd,0x17,0x8f,0xd9,0x48,0xcf,0x57,0x6b };
         uint8_t inner[16];
-        mvci_inner_set_config(7, 1, inner);
+        mvci_inner_set_config(4, 7, 1, inner);
         n = mvci_frame_enc(KEY_OLD, inner, sizeof inner, out, sizeof out);
         check("set_config(7,1) wire [old key]", out, n, exp, sizeof exp);
     }
 
-    /* 6. SET_CONFIG(param=7,value=0), KEY_NEW (frida capture) */
+    /* 6. SET_CONFIG(proto=4,param=7,value=0), KEY_NEW (frida capture) */
     {
         /* DES(0e000e0204000000)=6fa4af0b4b42d695 ; DES(0700000000000000)=c86c26f57b63d494 */
         static const uint8_t body[] = { 0x6f,0xa4,0xaf,0x0b,0x4b,0x42,0xd6,0x95,
@@ -109,7 +110,7 @@ static void selftest(void)
         uint8_t exp[MVCI_MAX_FRAME];
         int en = mvci_frame_plain(body, sizeof body, exp, sizeof exp);
         uint8_t inner[16];
-        mvci_inner_set_config(7, 0, inner);
+        mvci_inner_set_config(4, 7, 0, inner);
         n = mvci_frame_enc(KEY_NEW, inner, sizeof inner, out, sizeof out);
         check("set_config(7,0) wire [new key]", out, n, exp, en);
     }
@@ -204,6 +205,127 @@ static void selftest(void)
         int il = mvci_inner_connect(4, 4096, 10400, in);
         n = mvci_frame_enc(KEY_NEW, in, il, out, sizeof out);
         check("connect full frame [new key]", out, n, exp, en);
+    }
+
+    /* ---- T256 Corolla provider parity (T254/T255 captured vectors) ---- */
+    {
+        uint8_t in[32];
+        static const uint8_t exp4[] = { 0x0e,0x00,0x0e,0x02,0x04,0x00,0x00,0x00,
+                                        0x01,0x00,0x00,0x00,0x80,0x25,0x00,0x00 };
+        memset(in, 0, sizeof in);
+        int il = mvci_inner_set_config(4, 1, 9600, in);
+        check("set_config ISO14230 uses proto 4", in, il, exp4, sizeof exp4);
+    }
+    {
+        uint8_t in[32];
+        static const uint8_t exp3[] = { 0x0e,0x00,0x0e,0x02,0x03,0x00,0x00,0x00,
+                                        0x01,0x00,0x00,0x00,0x80,0x25,0x00,0x00 };
+        memset(in, 0, sizeof in);
+        int il = mvci_inner_set_config(3, 1, 9600, in);
+        check("set_config ISO9141 uses proto 3", in, il, exp3, sizeof exp3);
+    }
+    {
+        uint8_t in[32];
+        static const uint8_t e1[] = { 0x0e,0x00,0x0e,0x02,0x03,0x00,0x00,0x00,
+                                      0x01,0x00,0x00,0x00,0x80,0x25,0x00,0x00 };
+        static const uint8_t e2[] = { 0x0e,0x00,0x0e,0x02,0x03,0x00,0x00,0x00,
+                                      0x0c,0x00,0x00,0x00,0x00,0x00,0x00,0x00 };
+        static const uint8_t e3[] = { 0x0e,0x00,0x0e,0x02,0x03,0x00,0x00,0x00,
+                                      0x14,0x00,0x00,0x00,0x46,0x00,0x00,0x00 };
+        static const uint8_t e4[] = { 0x0e,0x00,0x0e,0x02,0x03,0x00,0x00,0x00,
+                                      0x15,0x00,0x00,0x00,0x50,0x00,0x00,0x00 };
+        memset(in, 0, sizeof in);
+        mvci_inner_set_config(3, 1, 9600, in);
+        check("t255 DATA_RATE=9600 proto3", in, 16, e1, sizeof e1);
+        mvci_inner_set_config(3, 0x0c, 0, in);
+        check("t255 P4_MIN=0 proto3", in, 16, e2, sizeof e2);
+        mvci_inner_set_config(3, 0x14, 70, in);
+        check("t255 TINIL=70 proto3", in, 16, e3, sizeof e3);
+        mvci_inner_set_config(3, 0x15, 80, in);
+        check("t255 TWUP=80 proto3", in, 16, e4, sizeof e4);
+    }
+    {
+        uint8_t in[32];
+        static const uint8_t exp[] = { 0x07,0x00,0x0e,0x04,0x03,0x00,0x00,0x00,0x33 };
+        memset(in, 0, sizeof in);
+        uint8_t a33 = 0x33;
+        int il = mvci_inner_five_baud_init(3, &a33, 1, in);
+        check("t254 five-baud(0x33) plaintext", in, il, exp, sizeof exp);
+    }
+    {
+        uint8_t in[32];
+        uint8_t a33 = 0x33;
+        int il = mvci_inner_five_baud_init(3, &a33, 1, in);
+        static const uint8_t exp[] = { 0x13,0x00,0x7b,0x37,0x94,0x41,0xd1,0x1b,0x1b,0xda,
+                                       0x2a,0x9b,0x91,0x32,0x40,0x7d,0xe7,0xf4,0xbd };
+        n = mvci_frame_enc(KEY_OLD, in, (size_t)il, out, sizeof out);
+        check("t254 five-baud frame 550", out, n, exp, sizeof exp);
+    }
+    {
+        uint8_t in[32];
+        int il = mvci_inner_five_baud_init(3, NULL, 0, in);
+        int ok = (il < 0);
+        printf("[%s] five-baud empty rejected\n", ok ? "PASS" : "FAIL");
+        ok ? g_pass++ : g_fail++;
+    }
+    {
+        uint8_t in[32];
+        static const uint8_t exp[] = { 0x09,0x00,0x0d,0x0f,0x00,0x00,0x00,0xfe,0xff,0xff,0xff };
+        memset(in, 0, sizeof in);
+        int il = mvci_inner_prog_voltage(15, 0xFFFFFFFEu, in);
+        check("t255 pin15 plaintext", in, il, exp, sizeof exp);
+    }
+    {
+        uint8_t in[32];
+        mvci_inner_prog_voltage(15, 0xFFFFFFFEu, in);
+        static const uint8_t exp[] = { 0x13,0x00,0x5e,0x5b,0x11,0x67,0xe9,0x3c,0xf5,0x2c,
+                                       0xc4,0x8a,0xfa,0x9b,0x6a,0x54,0x40,0xab,0x96 };
+        n = mvci_frame_enc(KEY_OLD, in, 11, out, sizeof out);
+        check("t255 pin15 frame 336", out, n, exp, sizeof exp);
+    }
+    {
+        uint8_t in[32];
+        static const uint8_t init10[] = { 0x00,0x00,0x13,0x00,0x01,0x00,0x27,0x6f,0x57,0xbc };
+        static const uint8_t expin[] = { 0x10,0x00,0x0e,0x05,0x03,0x00,0x00,0x00,
+                                         0x00,0x00,0x13,0x00,0x01,0x00,0x27,0x6f,0x57,0xbc };
+        memset(in, 0, sizeof in);
+        int il = mvci_inner_fast_init(3, init10, sizeof init10, in);
+        check("t255 fast_init plaintext", in, il, expin, sizeof expin);
+        static const uint8_t exp[] = { 0x1b,0x00,0xbd,0x62,0xce,0x9b,0x65,0x83,0xd6,0xf0,
+                                       0x59,0xf0,0xa9,0xda,0xa1,0x03,0x4e,0x31,0x8e,0xae,
+                                       0x65,0xbd,0xaa,0x1c,0x54,0xe6,0xaa };
+        n = mvci_frame_enc(KEY_OLD, in, (size_t)il, out, sizeof out);
+        check("t255 fast_init frame 438", out, n, exp, sizeof exp);
+    }
+    {
+        static const uint8_t disc5[] = { 0x02,0x00,0x0e,0x08,0x00,0x00,0x00,0x28 };
+        static const uint8_t discF[] = { 0x02,0x00,0x0e,0x08,0x00,0x00,0x00,0xf0 };
+        static const uint8_t okSet[] = { 0x02,0x00,0x0e,0x00,0x00,0x00,0x00,0x28 };
+        int ok = mvci_five_baud_is_disconnected(disc5, 8)
+              && !mvci_five_baud_is_disconnected(discF, 8)
+              && !mvci_five_baud_is_disconnected(okSet, 8)
+              && (ERR_DEVICE_NOT_CONNECTED == 8);
+        printf("[%s] five-baud disconnected -> error 8\n", ok ? "PASS" : "FAIL");
+        ok ? g_pass++ : g_fail++;
+    }
+    {
+        static const uint8_t discF[] = { 0x02,0x00,0x0e,0x08,0x00,0x00,0x00,0xf0 };
+        static const uint8_t disc5[] = { 0x02,0x00,0x0e,0x08,0x00,0x00,0x00,0x28 };
+        int ok = mvci_fast_init_is_timeout(discF, 8)
+              && !mvci_fast_init_is_timeout(disc5, 8)
+              && (ERR_TIMEOUT == 9);
+        printf("[%s] fast_init disconnected -> error 9\n", ok ? "PASS" : "FAIL");
+        ok ? g_pass++ : g_fail++;
+    }
+    {
+        int ok = mvci_prog_voltage_is_supported(15, 0xFFFFFFFEu)
+              && !mvci_prog_voltage_is_supported(15, 0)
+              && !mvci_prog_voltage_is_supported(15, 0xFFFFFFFFu)
+              && !mvci_prog_voltage_is_supported(15, 5000)
+              && !mvci_prog_voltage_is_supported(0, 0xFFFFFFFEu)
+              && !mvci_prog_voltage_is_supported(16, 0xFFFFFFFEu);
+        printf("[%s] prog voltage gate pin15 only\n", ok ? "PASS" : "FAIL");
+        ok ? g_pass++ : g_fail++;
     }
 
     printf("\nself-test: %d passed, %d failed\n\n", g_pass, g_fail);

@@ -79,10 +79,10 @@ static void put_u32(uint8_t *p, uint32_t v)
     p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
 }
 
-int mvci_inner_set_config(uint32_t param, uint32_t value, uint8_t *inner)
+int mvci_inner_set_config(uint32_t proto, uint32_t param, uint32_t value, uint8_t *inner)
 {
-    static const uint8_t hdr[8] = { 0x0e, 0x00, 0x0e, 0x02, 0x04, 0x00, 0x00, 0x00 };
-    memcpy(inner, hdr, 8);
+    inner[0] = 0x0e; inner[1] = 0x00; inner[2] = 0x0e; inner[3] = 0x02;
+    put_u32(inner + 4, proto);
     put_u32(inner + 8, param);
     put_u32(inner + 12, value);
     return 16;
@@ -126,6 +126,24 @@ int mvci_inner_fast_init(uint32_t proto, const uint8_t *init, size_t n, uint8_t 
     return (int)(8 + n);
 }
 
+int mvci_inner_five_baud_init(uint32_t proto, const uint8_t *addr, size_t naddr, uint8_t *inner)
+{
+    if (!addr || naddr == 0 || naddr > MVCI_MAX_INNER - 8) return -1;
+    inner[0] = (uint8_t)(6 + naddr);
+    inner[1] = 0x00; inner[2] = 0x0e; inner[3] = 0x04;
+    put_u32(inner + 4, proto);
+    memcpy(inner + 8, addr, naddr);
+    return (int)(8 + naddr);
+}
+
+int mvci_inner_prog_voltage(uint32_t pin, uint32_t voltage, uint8_t *inner)
+{
+    inner[0] = 0x09; inner[1] = 0x00; inner[2] = 0x0d;
+    put_u32(inner + 3, pin);
+    put_u32(inner + 7, voltage);
+    return 11;
+}
+
 int mvci_inner_write_msg(uint32_t proto, const uint8_t *msg, size_t n, uint8_t *inner)
 {
     inner[0] = (uint8_t)(1 + 8 + n);
@@ -153,6 +171,25 @@ int mvci_parse_read_reply(const uint8_t *inner, int inner_len,
     if (11 + mlen > inner_len || (size_t)mlen > cap) return -1;
     memcpy(msg_out, inner + 11, mlen);
     return mlen;
+}
+
+int mvci_five_baud_is_disconnected(const uint8_t *resp, int r)
+{
+    static const uint8_t disc[8] = { 0x02,0x00,0x0e,0x08,0x00,0x00,0x00,0x28 };
+    if (r != 8 || !resp) return 0;
+    return memcmp(resp, disc, 8) == 0;
+}
+
+int mvci_fast_init_is_timeout(const uint8_t *resp, int r)
+{
+    static const uint8_t disc[8] = { 0x02,0x00,0x0e,0x08,0x00,0x00,0x00,0xf0 };
+    if (r != 8 || !resp) return 0;
+    return memcmp(resp, disc, 8) == 0;
+}
+
+int mvci_prog_voltage_is_supported(uint32_t pin, uint32_t voltage)
+{
+    return pin == 15 && voltage == 0xFFFFFFFEu;
 }
 
 /* ======================================================================
@@ -365,9 +402,31 @@ int mvci_start_filter(mvci_ctx_t *ctx, uint32_t msgid, uint8_t mask, uint8_t pat
 int mvci_set_config(mvci_ctx_t *ctx, uint32_t param, uint32_t value)
 {
     uint8_t in[16], resp[64];
-    mvci_inner_set_config(param, value, in);
+    mvci_inner_set_config(ctx->proto, param, value, in);
     int r = mvci_transact(ctx, in, sizeof in, resp, sizeof resp, 2000);
     return (r >= 3 && resp[0] == 0x02 && resp[2] == 0x0e) ? 0 : -1;
+}
+
+int mvci_set_prog_voltage(mvci_ctx_t *ctx, uint32_t pin, uint32_t voltage)
+{
+    uint8_t in[16], resp[64];
+    int n = mvci_inner_prog_voltage(pin, voltage, in);
+    if (n < 0) return -1;
+    int r = mvci_transact(ctx, in, (size_t)n, resp, sizeof resp, 2000);
+    return (r >= 3 && resp[0] == 0x02 && resp[2] == 0x0d) ? 0 : -1;
+}
+
+int mvci_five_baud_init(mvci_ctx_t *ctx, const uint8_t *addr, size_t naddr,
+                        uint8_t *out, size_t cap)
+{
+    (void)out; (void)cap;
+    uint8_t in[32], resp[64];
+    int ilen = mvci_inner_five_baud_init(ctx->proto, addr, naddr, in);
+    if (ilen < 0) return -1;
+    mvci_sleep_ms(2000);
+    int r = mvci_transact(ctx, in, (size_t)ilen, resp, sizeof resp, 5000);
+    if (mvci_five_baud_is_disconnected(resp, r)) return MVCI_FB_NOT_CONNECTED;
+    return -1;
 }
 
 int mvci_clear_periodic(mvci_ctx_t *ctx)
@@ -385,14 +444,10 @@ int mvci_fast_init(mvci_ctx_t *ctx, const uint8_t *init, size_t n,
     int ilen = mvci_inner_fast_init(ctx->proto, init, n, in);
     int r = mvci_transact(ctx, in, ilen, resp, sizeof resp, 3000);
     if (r < 3 || resp[2] != 0x0e) return -1;
-    /* Two reply shapes arrive here. A message reply (ILEN 0x08) carries the ECU
-     * key bytes. A status reply (ILEN 0x02) is only the device acknowledging the
-     * command; the ECU said nothing. Returning a slice of the status reply as if
-     * it were an ECU answer makes a silent bus look like a live one, so report
-     * zero bytes instead. */
+    if (mvci_fast_init_is_timeout(resp, r)) return MVCI_FI_TIMEOUT;
     if (resp[0] == 0x02) {
-        dbg_hex("fast init: status reply, no ECU key bytes:", resp, r);
-        return 0;
+        dbg_hex("fast init: status reply, fail closed:", resp, r);
+        return -1;
     }
     int mlen = (int)resp[0] - 1;                 /* 08 -> 7 ECU key bytes @ off 3 */
     if (mlen < 0 || 3 + mlen > r) mlen = (r > 3) ? r - 3 : 0;

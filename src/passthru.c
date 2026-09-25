@@ -280,12 +280,38 @@ J2534_LONG J2534_API PassThruIoctl(J2534_ULONG ChannelID, J2534_ULONG IoctlID,
         if (!in || in->DataSize == 0) return ERR_NULL_PARAMETER;
         uint8_t reply[32];
         int k = mvci_fast_init(s->ctx, in->Data, in->DataSize, reply, sizeof reply);
+        if (k == MVCI_FI_TIMEOUT) {
+            if (out) {
+                memset(out, 0, sizeof *out);
+                out->DataSize = 0;
+            }
+            set_err("fast init timeout");
+            return ERR_TIMEOUT;
+        }
         if (k < 0) { set_err("fast init failed"); return ERR_FAILED; }
         if (out) {
             memset(out, 0, sizeof *out);
             out->ProtocolID = s->proto;
             out->DataSize = (uint32_t)k;
             memcpy(out->Data, reply, (size_t)k);
+        }
+        return STATUS_NOERROR;
+    }
+
+    case FIVE_BAUD_INIT: {
+        SBYTE_ARRAY *in = (SBYTE_ARRAY *)pInput;
+        SBYTE_ARRAY *out = (SBYTE_ARRAY *)pOutput;
+        if (!in || in->NumOfBytes == 0 || !in->BytePtr) return ERR_INVALID_IOCTL_VALUE;
+        uint8_t reply[32];
+        int k = mvci_five_baud_init(s->ctx, in->BytePtr, in->NumOfBytes, reply, sizeof reply);
+        if (k == MVCI_FB_NOT_CONNECTED) {
+            set_err("five-baud no ECU answer");
+            return ERR_DEVICE_NOT_CONNECTED;
+        }
+        if (k < 0) { set_err("five-baud failed"); return ERR_FAILED; }
+        if (out && out->BytePtr && out->NumOfBytes >= (uint32_t)k) {
+            memcpy(out->BytePtr, reply, (size_t)k);
+            out->NumOfBytes = (uint32_t)k;
         }
         return STATUS_NOERROR;
     }
@@ -307,7 +333,20 @@ J2534_LONG J2534_API PassThruStopPeriodicMsg(J2534_ULONG ChannelID, J2534_ULONG 
 
 J2534_LONG J2534_API PassThruSetProgrammingVoltage(J2534_ULONG DeviceID, J2534_ULONG PinNumber,
                                              J2534_ULONG Voltage)
-{ (void)DeviceID;(void)PinNumber;(void)Voltage; return ERR_NOT_SUPPORTED; }
+{
+    ensure_init();
+    slot_t *s = dev_slot(DeviceID);
+    if (!s) { set_err("invalid device id"); return ERR_INVALID_DEVICE_ID; }
+    if (!mvci_prog_voltage_is_supported(PinNumber, Voltage)) {
+        set_err("prog voltage not supported");
+        return ERR_NOT_SUPPORTED;
+    }
+    if (mvci_set_prog_voltage(s->ctx, PinNumber, Voltage) != 0) {
+        set_err("prog voltage failed");
+        return ERR_FAILED;
+    }
+    return STATUS_NOERROR;
+}
 
 J2534_LONG J2534_API PassThruReadVersion(J2534_ULONG DeviceID, char *pFirmwareVersion,
                                    char *pDllVersion, char *pApiVersion)
