@@ -74,6 +74,7 @@ int mvci_inner_read_poll(uint8_t *inner);
  * for the exact captured bytes, 0 otherwise. No other status meaning is
  * proven. */
 int mvci_five_baud_is_disconnected(const uint8_t *resp, int r);
+int mvci_five_baud_is_corolla_success(const uint8_t *resp, int r);
 int mvci_fast_init_is_timeout(const uint8_t *resp, int r);
 /* Pure programming-voltage gate. Returns 1 only for Pin 15 SHORT_TO_GROUND
  * (0xFFFFFFFE). All other pin/value pairs must stay unsupported. */

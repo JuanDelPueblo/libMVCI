@@ -117,7 +117,7 @@ denotes a little‑endian field.
 | Set config (one param) | `0E`/`02` | `0E 00 0E 02` `[proto u32]` `[param u32]` `[value u32]` | status `02 00 0E` |
 | Clear periodic msgs | `0E`/`09` | `06 00 0E 09` `[proto u32]` | status `02 00 0E` |
 | Fast init | `0E`/`05` | `ILEN 00 0E 05` `[proto u32]` `init bytes…` | message reply (ECU key bytes), or status §6.3 |
-| Five-baud init | `0E`/`04` | `ILEN 00 0E 04` `[proto u32]` `address bytes…` | status §6.3; success wire shape unobserved |
+| Five-baud init | `0E`/`04` | `ILEN 00 0E 04` `[proto u32]` `address bytes…` | status §6.3; Corolla success shape below |
 | Prog voltage | `0D` | `09 00 0D` `[pin u32]` `[voltage u32]` | status `02 00 0D` |
 | Write message | `0A` | `0E 00 0A` `[proto u32]` `[flags u32]` `msg bytes…` | status `02 00 0A` |
 | Read poll | `09`/`04` | `05 00 09 04 00 00 00 00` | message reply, or empty status |
@@ -201,12 +201,14 @@ Adapter-only failure replies (OBD disconnected, no ECU traffic):
 - Unknown status replies fail closed. The bytes `08` and `F0`/`28` have no
   proven general meaning. Do not infer a firmware code map from them.
 
-Still unobserved:
+Corolla vehicle observation, 2026-10-12, stationary with engine on:
 
-- No successful five-baud wire reply exists in captures. Static evidence says a
-  success returns two key bytes with `STATUS_NOERROR`, but the wire shape was
-  never recorded. The code leaves any other five-baud reply fail-closed. Live
-  five-baud success against an ECU remains unevidenced. Do not claim it.
+- `FIVE_BAUD_INIT(0x33)` on ISO9141 returned decrypted inner
+  `03 00 0E 08 08 00 00 00`. The two key bytes are `08 08`. The provider
+  accepts only this exact success reply and leaves other shapes fail-closed.
+- The following functional Mode 09 `0903` request received no ECU frame in
+  four seconds. Adapter acceptance of a write is not proof of bus delivery
+  or ECU acceptance. Do not claim an established diagnostic session.
 
 ## 7. Keepalive
 

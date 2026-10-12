@@ -193,6 +193,12 @@ int mvci_five_baud_is_disconnected(const uint8_t *resp, int r)
     return memcmp(resp, disc, 8) == 0;
 }
 
+int mvci_five_baud_is_corolla_success(const uint8_t *resp, int r)
+{
+    static const uint8_t success[8] = { 0x03,0x00,0x0e,0x08,0x08,0x00,0x00,0x00 };
+    return r == 8 && resp && memcmp(resp, success, sizeof success) == 0;
+}
+
 int mvci_fast_init_is_timeout(const uint8_t *resp, int r)
 {
     static const uint8_t disc[8] = { 0x02,0x00,0x0e,0x08,0x00,0x00,0x00,0xf0 };
@@ -460,7 +466,6 @@ int mvci_set_prog_voltage(mvci_ctx_t *ctx, uint32_t pin, uint32_t voltage)
 int mvci_five_baud_init(mvci_ctx_t *ctx, const uint8_t *addr, size_t naddr,
                         uint8_t *out, size_t cap)
 {
-    (void)out; (void)cap;
     /* Sized for the constructor's full accepted range (8 + up to 248 address
      * bytes), so an in-range input can never overrun this buffer. */
     uint8_t in[MVCI_MAX_INNER], resp[64];
@@ -469,6 +474,11 @@ int mvci_five_baud_init(mvci_ctx_t *ctx, const uint8_t *addr, size_t naddr,
     mvci_sleep_ms(2000);
     int r = mvci_transact(ctx, in, (size_t)ilen, resp, sizeof resp, 5000);
     if (mvci_five_baud_is_disconnected(resp, r)) return MVCI_FB_NOT_CONNECTED;
+    if (mvci_five_baud_is_corolla_success(resp, r) && out && cap >= 2) {
+        out[0] = resp[3];
+        out[1] = resp[4];
+        return 2;
+    }
     return -1;
 }
 
