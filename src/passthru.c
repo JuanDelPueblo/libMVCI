@@ -291,8 +291,10 @@ J2534_LONG J2534_API PassThruIoctl(J2534_ULONG ChannelID, J2534_ULONG IoctlID,
     case CLEAR_PERIODIC_MSGS:
         return mvci_clear_periodic(s->ctx) == 0 ? STATUS_NOERROR : ERR_FAILED;
 
-    case CLEAR_TX_BUFFER:
     case CLEAR_RX_BUFFER:
+        return mvci_clear_rx_buffer(s->ctx) == 0 ? STATUS_NOERROR : ERR_FAILED;
+
+    case CLEAR_TX_BUFFER:
     case CLEAR_MSG_FILTERS:
         return STATUS_NOERROR;
 

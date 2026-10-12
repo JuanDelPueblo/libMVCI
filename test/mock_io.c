@@ -35,6 +35,9 @@ static uint8_t g_asm[MOCK_RAW_MAX + 1];
 static int g_asmlen;
 static uint8_t g_queue[MOCK_QUEUE];
 static int g_qhead, g_qtail;
+static int g_async_reply;
+
+void mock_async_reply(int mode) { g_async_reply = mode; }
 
 const uint8_t *mock_key(void) { return MOCK_KEY; }
 
@@ -68,6 +71,22 @@ static void answer(const uint8_t *inner, int ilen)
 {
     uint8_t st[8];
     if (ilen < 4) return;
+    if (inner[2] == 0x0a && g_async_reply) {
+        /* Synthetic arrival ordering with the captured T002 PID03 payload.
+         * The wire message layout is the existing codec's read-reply shape. */
+        static const uint8_t msg[] = {
+            0x10,0x00,0x09,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+            0x48,0x6b,0x10,0x49,0x03,0x04,0x13
+        };
+        static const uint8_t ack[8] = { 0x02,0x00,0x0a,0x00,0x00,0x00,0x00,0x00 };
+        uint8_t frame[MVCI_MAX_FRAME];
+        int n = mvci_frame_enc(MOCK_KEY, msg, sizeof msg, frame, sizeof frame);
+        if (g_async_reply == 1 && n > 0) queue_bytes(frame, n);
+        queue_status(ack);
+        if (g_async_reply == 2 && n > 0) queue_bytes(frame, n);
+        g_async_reply = 0;
+        return;
+    }
     if (ilen >= 4 && inner[2] == 0x07) {
         static const uint8_t r[8] = { 0x02, 0x00, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00 };
         memcpy(st, r, 8);
@@ -142,6 +161,7 @@ mvci_io_t *mvci_io_open(const char *port)
     g_nwritten = 0;
     g_asmlen = 0;
     g_qhead = g_qtail = 0;
+    g_async_reply = 0;
     return &g_io;
 }
 

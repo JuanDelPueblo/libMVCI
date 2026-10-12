@@ -222,6 +222,9 @@ struct mvci_ctx {
     int              have_key;
     uint8_t          key[8];
     uint32_t         proto;      /* J2534 ProtocolID of the connected channel */
+    uint8_t          pending[16][MVCI_MAX_INNER];
+    int              pending_len[16];
+    int              pending_count;
     mvci_mutex_t     lock;       /* serialises device I/O */
     mvci_thread_t    ka_thread;
     volatile int     ka_run;
@@ -270,11 +273,14 @@ const uint8_t *mvci_key(const mvci_ctx_t *ctx)
 /* read one framed message: LEN byte, then LEN-1 more bytes */
 static int read_frame(mvci_ctx_t *ctx, uint8_t *buf, int cap, int timeout_ms)
 {
+    uint32_t deadline = mvci_now_ms() + (uint32_t)timeout_ms;
     uint8_t len;
     if (mvci_io_read(ctx->io, &len, 1, timeout_ms) < 1) return -1;
     if (len < 3 || len > cap) return -1;
     buf[0] = len;
-    if (mvci_io_read(ctx->io, buf + 1, len - 1, timeout_ms) < len - 1) return -1;
+    int remaining = (int32_t)(deadline - mvci_now_ms());
+    if (remaining <= 0 || mvci_io_read(ctx->io, buf + 1, len - 1, remaining) < len - 1)
+        return -1;
     return len;
 }
 
@@ -321,15 +327,30 @@ static int transact_locked(mvci_ctx_t *ctx, const uint8_t *inner, size_t inner_l
     if (n < 0) return -1;
 
     dbg_hex("TX inner:", inner, (int)inner_len);
-    mvci_io_purge_rx(ctx->io);
     if (mvci_io_write(ctx->io, frame, n) != n) return -1;
-
-    n = read_frame(ctx, frame, sizeof frame, timeout_ms);
-    if (n < 0) { if (dbg_on()) fprintf(stderr, "  RX: timeout\n"); return -1; }
-    int r = mvci_frame_decrypt(ctx->key, frame, n, resp_inner, resp_cap);
-    if (r < 0) { dbg_hex("RX raw(bad):", frame, n); return -1; }
-    dbg_hex("RX inner:", resp_inner, r);
-    return r;
+    uint32_t deadline = mvci_now_ms() + (uint32_t)timeout_ms;
+    for (;;) {
+        int remaining = (int32_t)(deadline - mvci_now_ms());
+        if (remaining <= 0) return -1;
+        n = read_frame(ctx, frame, sizeof frame, remaining);
+        if (n < 0) { if (dbg_on()) fprintf(stderr, "  RX: timeout\n"); return -1; }
+        int r = mvci_frame_decrypt(ctx->key, frame, n, resp_inner, resp_cap);
+        if (r < 3 || resp_inner[1] != 0) {
+            dbg_hex("RX raw(bad):", frame, n);
+            return -1;
+        }
+        dbg_hex("RX inner:", resp_inner, r);
+        if (resp_inner[2] == inner[2]) return r;
+        /* A message may arrive before a command acknowledgement. Preserve it
+         * for the next read instead of flushing it or mistaking it for ACK. */
+        if (resp_inner[2] != 0x09) return -1;
+        int mlen = (int)resp_inner[0] - 9;
+        if (mlen <= 0) continue; /* empty read/keepalive status */
+        if (11 + mlen > r || ctx->pending_count >= 16) return -1;
+        int slot = ctx->pending_count++;
+        memcpy(ctx->pending[slot], resp_inner, (size_t)r);
+        ctx->pending_len[slot] = r;
+    }
 }
 
 int mvci_transact(mvci_ctx_t *ctx, const uint8_t *inner, size_t inner_len,
@@ -526,11 +547,35 @@ int mvci_write_msg(mvci_ctx_t *ctx, const uint8_t *msg, size_t n)
 int mvci_poll(mvci_ctx_t *ctx, uint8_t *msg_out, size_t cap,
               uint8_t *rxstatus_out, int timeout_ms)
 {
-    uint8_t in[8], resp[64];
+    uint8_t in[8], resp[MVCI_MAX_INNER];
     int n = mvci_inner_read_poll(in);
-    int r = mvci_transact(ctx, in, n, resp, sizeof resp, timeout_ms);
+    if (!ctx->have_key) return -1;
+    mvci_mutex_lock(&ctx->lock);
+    int r;
+    if (ctx->pending_count) {
+        r = ctx->pending_len[0];
+        memcpy(resp, ctx->pending[0], (size_t)r);
+        ctx->pending_count--;
+        memmove(ctx->pending, ctx->pending + 1,
+                (size_t)ctx->pending_count * sizeof ctx->pending[0]);
+        memmove(ctx->pending_len, ctx->pending_len + 1,
+                (size_t)ctx->pending_count * sizeof ctx->pending_len[0]);
+    } else {
+        r = transact_locked(ctx, in, (size_t)n, resp, sizeof resp, timeout_ms);
+    }
+    mvci_mutex_unlock(&ctx->lock);
     if (r < 0) return -1;
     return mvci_parse_read_reply(resp, r, msg_out, cap, rxstatus_out);
+}
+
+int mvci_clear_rx_buffer(mvci_ctx_t *ctx)
+{
+    if (!ctx || !ctx->have_key) return -1;
+    mvci_mutex_lock(&ctx->lock);
+    ctx->pending_count = 0;
+    mvci_io_purge_rx(ctx->io);
+    mvci_mutex_unlock(&ctx->lock);
+    return 0;
 }
 
 int mvci_read_msg(mvci_ctx_t *ctx, uint8_t *msg_out, size_t cap, int timeout_ms)

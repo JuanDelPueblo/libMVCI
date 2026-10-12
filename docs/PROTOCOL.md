@@ -182,6 +182,22 @@ A typical request/response exchange (read poll loop) returns, in order: zero or
 more "no data" replies, one echo (`RxStatus = 02`), then the ECU data
 (`RxStatus = 00`).
 
+### Receive queue handling
+
+Do not flush the serial receive buffer before each transaction. A complete
+message may already be waiting, or may precede the acknowledgement for a
+different command. The session matches acknowledgements by command opcode,
+stores up to 16 intervening message replies, and delivers them once through
+the next read. Malformed replies, unrelated command replies, and queue
+overflow fail the transaction. One deadline covers the transaction's reads.
+
+`CLEAR_RX_BUFFER` explicitly clears this software queue and the host serial
+receive buffer. It sends no adapter or vehicle command. Clearing an unread
+mailbox inside the adapter is not implemented or claimed; its vendor wire
+transaction still needs evidence. Offline native-provider tests reproduce
+messages arriving before and after a write ACK. These tests do not establish
+that this ordering caused the observed vehicle timeout.
+
 ### 6.3 Proven command construction vs adapter-only failures
 
 Proven construction (decrypts with the current session key, matches captures):
