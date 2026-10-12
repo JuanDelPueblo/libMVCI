@@ -142,14 +142,17 @@ Notes:
   stay unsupported. No positive voltage is implemented.
 - **Write message** `msg bytes` is the raw protocol message, e.g. an ISO14230
   request `82 <addr> F0 01 <pid>`.
-- The host should issue **Clear periodic msgs** immediately before each Write
-  message to arm a fresh K‑line transaction.
+- The original KWP helper issues **Clear periodic msgs** before each Write.
+  This is not a general ISO9141 requirement: the successful Corolla rate
+  benchmark used no such call.
 - The original read-poll capture used protocol 4. Its four argument bytes fit
   the same little-endian ProtocolID field as other channel operations. A
   Corolla session connected and wrote with protocol 3 but polled 4 and got
-  no frames. The poll now uses the connected ProtocolID. The field meaning
-  is an inference pending a vehicle reply through protocol-3 polling; the
-  protocol-4 packet stays identical to the captured vector.
+  no frames. Changing only the poll argument to 3 returned the CalID and
+  333 complete timed RPM/TPS replies on 2026-10-12. The poll now uses the
+  connected ProtocolID; the protocol-4 packet stays identical to the
+  captured vector. This vehicle result covers Mini-VCI firmware 1.03 and
+  Corolla CalID `30272200`, not other protocol IDs or firmware builds.
 - The vendor waits about 2000 ms before it sends the five-baud command. The
   adapter answer for one address byte took about 2670 ms with OBD disconnected.
   The host must allow at least 5000 ms for the reply.
@@ -228,9 +231,11 @@ Corolla vehicle observation, 2026-10-12, stationary with engine on:
 - `FIVE_BAUD_INIT(0x33)` on ISO9141 returned decrypted inner
   `03 00 0E 08 08 00 00 00`. The two key bytes are `08 08`. The provider
   accepts only this exact success reply and leaves other shapes fail-closed.
-- The following functional Mode 09 `0903` request received no ECU frame in
-  four seconds. Adapter acceptance of a write is not proof of bus delivery
-  or ECU acceptance. Do not claim an established diagnostic session.
+- With the original protocol-4 read poll, the following functional Mode 09
+  `0903` request returned no ECU frame in four seconds. With protocol-3
+  polling, identity and the 90-second RPM/TPS benchmark completed with 333
+  valid samples and zero errors. Single-signal rate was 3.683 Hz; interleaved
+  rates were 1.858 Hz RPM and 1.825 Hz TPS under conservative host pacing.
 
 ## 7. Keepalive
 
