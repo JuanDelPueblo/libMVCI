@@ -22,6 +22,7 @@ const uint8_t *mock_key(void);
 int mock_frame_count(void);
 int mock_frame_bytes(int idx, uint8_t *out, int cap);
 void mock_async_reply(int mode);
+void mock_poll_reply(void);
 
 static int g_pass, g_fail;
 
@@ -329,6 +330,32 @@ static void test_queued_diagnostic_reply(void)
     }
 }
 
+static void test_poll_connected_protocol(void)
+{
+    puts("--- read poll addresses the connected protocol ---");
+    for (uint32_t protocol = ISO9141; protocol <= ISO14230; protocol++) {
+        J2534_ULONG dev = open_dev(), ch = 0;
+        ok(PassThruConnect(dev, protocol, 0x1200, 10400, &ch) == STATUS_NOERROR,
+           "connect protocol for addressed poll check");
+        PASSTHRU_MSG tx, rx;
+        memset(&tx, 0, sizeof tx);
+        static const uint8_t req[] = { 0x68,0x6a,0xf1,0x09,0x03,0xcf };
+        memcpy(tx.Data, req, sizeof req);
+        tx.DataSize = sizeof req;
+        tx.ProtocolID = protocol;
+        J2534_ULONG count = 1;
+        mock_poll_reply();
+        ok(PassThruWriteMsgs(ch, &tx, &count, 1000) == STATUS_NOERROR,
+           "write queues a device-side diagnostic reply");
+        count = 1;
+        ok(PassThruReadMsgs(ch, &rx, &count, 20) == STATUS_NOERROR && count == 1
+           && rx.DataSize == 7 && rx.Data[3] == 0x49 && rx.Data[4] == 0x03,
+           "read poll retrieves the connected protocol queue");
+        ok(PassThruDisconnect(ch) == STATUS_NOERROR, "poll test disconnect");
+        ok(PassThruClose(dev) == STATUS_NOERROR, "poll test close");
+    }
+}
+
 int main(void)
 {
     puts("=== seq-test (mock device, exact wire sequences) ===");
@@ -336,6 +363,7 @@ int main(void)
     test_programming_entry();
     test_oversize_public_path();
     test_queued_diagnostic_reply();
+    test_poll_connected_protocol();
     printf("\nseq-test: %d passed, %d failed\n\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }

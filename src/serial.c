@@ -167,10 +167,11 @@ int mvci_inner_write_msg(uint32_t proto, const uint8_t *msg, size_t n, uint8_t *
     return (int)(11 + n);
 }
 
-int mvci_inner_read_poll(uint8_t *inner)
+int mvci_inner_read_poll(uint32_t proto, uint8_t *inner)
 {
-    static const uint8_t b[8] = { 0x05, 0x00, 0x09, 0x04, 0x00, 0x00, 0x00, 0x00 };
-    memcpy(inner, b, 8);
+    inner[0] = 0x05; inner[1] = 0x00; inner[2] = 0x09;
+    put_u32(inner + 3, proto);
+    inner[7] = 0x00;
     return 8;
 }
 
@@ -548,7 +549,7 @@ int mvci_poll(mvci_ctx_t *ctx, uint8_t *msg_out, size_t cap,
               uint8_t *rxstatus_out, int timeout_ms)
 {
     uint8_t in[8], resp[MVCI_MAX_INNER];
-    int n = mvci_inner_read_poll(in);
+    int n = mvci_inner_read_poll(ctx->proto, in);
     if (!ctx->have_key) return -1;
     mvci_mutex_lock(&ctx->lock);
     int r;

@@ -120,7 +120,7 @@ denotes a little‑endian field.
 | Five-baud init | `0E`/`04` | `ILEN 00 0E 04` `[proto u32]` `address bytes…` | status §6.3; Corolla success shape below |
 | Prog voltage | `0D` | `09 00 0D` `[pin u32]` `[voltage u32]` | status `02 00 0D` |
 | Write message | `0A` | `0E 00 0A` `[proto u32]` `[flags u32]` `msg bytes…` | status `02 00 0A` |
-| Read poll | `09`/`04` | `05 00 09 04 00 00 00 00` | message reply, or empty status |
+| Read poll | `09` | `05 00 09` `[proto u32]` `00` | message reply, or empty status |
 | Keepalive | `09`/`06` | `05 00 09 06 00 00 00 00` | status `02 00 09` |
 | Disconnect | `02` | `01 00 02 00 00 00 00 00` | status `02 00 02` |
 
@@ -144,6 +144,12 @@ Notes:
   request `82 <addr> F0 01 <pid>`.
 - The host should issue **Clear periodic msgs** immediately before each Write
   message to arm a fresh K‑line transaction.
+- The original read-poll capture used protocol 4. Its four argument bytes fit
+  the same little-endian ProtocolID field as other channel operations. A
+  Corolla session connected and wrote with protocol 3 but polled 4 and got
+  no frames. The poll now uses the connected ProtocolID. The field meaning
+  is an inference pending a vehicle reply through protocol-3 polling; the
+  protocol-4 packet stays identical to the captured vector.
 - The vendor waits about 2000 ms before it sends the five-baud command. The
   adapter answer for one address byte took about 2670 ms with OBD disconnected.
   The host must allow at least 5000 ms for the reply.

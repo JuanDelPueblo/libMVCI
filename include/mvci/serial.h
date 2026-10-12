@@ -68,7 +68,7 @@ int mvci_inner_fast_init(uint32_t proto, const uint8_t *init, size_t n, uint8_t 
 int mvci_inner_five_baud_init(uint32_t proto, const uint8_t *addr, size_t naddr, uint8_t *inner);
 int mvci_inner_prog_voltage(uint32_t pin, uint32_t voltage, uint8_t *inner);
 int mvci_inner_write_msg(uint32_t proto, const uint8_t *msg, size_t n, uint8_t *inner);
-int mvci_inner_read_poll(uint8_t *inner);
+int mvci_inner_read_poll(uint32_t proto, uint8_t *inner);
 
 /* Pure reply classifiers for the evidenced adapter-only failures. Return 1
  * for the exact captured bytes, 0 otherwise. No other status meaning is
