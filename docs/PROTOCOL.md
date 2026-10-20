@@ -117,10 +117,10 @@ denotes a little‑endian field.
 | Set config (one param) | `0E`/`02` | `0E 00 0E 02` `[proto u32]` `[param u32]` `[value u32]` | status `02 00 0E` |
 | Clear periodic msgs | `0E`/`09` | `06 00 0E 09` `[proto u32]` | status `02 00 0E` |
 | Fast init | `0E`/`05` | `ILEN 00 0E 05` `[proto u32]` `init bytes…` | message reply (ECU key bytes), or status §6.3 |
-| Five-baud init | `0E`/`04` | `ILEN 00 0E 04` `[proto u32]` `address bytes…` | status §6.3; success wire shape unobserved |
+| Five-baud init | `0E`/`04` | `ILEN 00 0E 04` `[proto u32]` `address bytes…` | status §6.3; Corolla success shape below |
 | Prog voltage | `0D` | `09 00 0D` `[pin u32]` `[voltage u32]` | status `02 00 0D` |
 | Write message | `0A` | `0E 00 0A` `[proto u32]` `[flags u32]` `msg bytes…` | status `02 00 0A` |
-| Read poll | `09`/`04` | `05 00 09 04 00 00 00 00` | message reply, or empty status |
+| Read poll | `09` | `05 00 09` `[proto u32]` `00` | message reply, or empty status |
 | Keepalive | `09`/`06` | `05 00 09 06 00 00 00 00` | status `02 00 09` |
 | Disconnect | `02` | `01 00 02 00 00 00 00 00` | status `02 00 02` |
 
@@ -142,8 +142,17 @@ Notes:
   stay unsupported. No positive voltage is implemented.
 - **Write message** `msg bytes` is the raw protocol message, e.g. an ISO14230
   request `82 <addr> F0 01 <pid>`.
-- The host should issue **Clear periodic msgs** immediately before each Write
-  message to arm a fresh K‑line transaction.
+- The original KWP helper issues **Clear periodic msgs** before each Write.
+  This is not a general ISO9141 requirement: the successful Corolla rate
+  benchmark used no such call.
+- The original read-poll capture used protocol 4. Its four argument bytes fit
+  the same little-endian ProtocolID field as other channel operations. A
+  Corolla session connected and wrote with protocol 3 but polled 4 and got
+  no frames. Changing only the poll argument to 3 returned the CalID and
+  333 complete timed RPM/TPS replies on 2026-10-12. The poll now uses the
+  connected ProtocolID; the protocol-4 packet stays identical to the
+  captured vector. This vehicle result covers Mini-VCI firmware 1.03 and
+  Corolla CalID `30272200`, not other protocol IDs or firmware builds.
 - The vendor waits about 2000 ms before it sends the five-baud command. The
   adapter answer for one address byte took about 2670 ms with OBD disconnected.
   The host must allow at least 5000 ms for the reply.
@@ -182,6 +191,22 @@ A typical request/response exchange (read poll loop) returns, in order: zero or
 more "no data" replies, one echo (`RxStatus = 02`), then the ECU data
 (`RxStatus = 00`).
 
+### Receive queue handling
+
+Do not flush the serial receive buffer before each transaction. A complete
+message may already be waiting, or may precede the acknowledgement for a
+different command. The session matches acknowledgements by command opcode,
+stores up to 16 intervening message replies, and delivers them once through
+the next read. Malformed replies, unrelated command replies, and queue
+overflow fail the transaction. One deadline covers the transaction's reads.
+
+`CLEAR_RX_BUFFER` explicitly clears this software queue and the host serial
+receive buffer. It sends no adapter or vehicle command. Clearing an unread
+mailbox inside the adapter is not implemented or claimed; its vendor wire
+transaction still needs evidence. Offline native-provider tests reproduce
+messages arriving before and after a write ACK. These tests do not establish
+that this ordering caused the observed vehicle timeout.
+
 ### 6.3 Proven command construction vs adapter-only failures
 
 Proven construction (decrypts with the current session key, matches captures):
@@ -201,12 +226,16 @@ Adapter-only failure replies (OBD disconnected, no ECU traffic):
 - Unknown status replies fail closed. The bytes `08` and `F0`/`28` have no
   proven general meaning. Do not infer a firmware code map from them.
 
-Still unobserved:
+Corolla vehicle observation, 2026-10-12, stationary with engine on:
 
-- No successful five-baud wire reply exists in captures. Static evidence says a
-  success returns two key bytes with `STATUS_NOERROR`, but the wire shape was
-  never recorded. The code leaves any other five-baud reply fail-closed. Live
-  five-baud success against an ECU remains unevidenced. Do not claim it.
+- `FIVE_BAUD_INIT(0x33)` on ISO9141 returned decrypted inner
+  `03 00 0E 08 08 00 00 00`. The two key bytes are `08 08`. The provider
+  accepts only this exact success reply and leaves other shapes fail-closed.
+- With the original protocol-4 read poll, the following functional Mode 09
+  `0903` request returned no ECU frame in four seconds. With protocol-3
+  polling, identity and the 90-second RPM/TPS benchmark completed with 333
+  valid samples and zero errors. Single-signal rate was 3.683 Hz; interleaved
+  rates were 1.858 Hz RPM and 1.825 Hz TPS under conservative host pacing.
 
 ## 7. Keepalive
 

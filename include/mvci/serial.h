@@ -68,12 +68,13 @@ int mvci_inner_fast_init(uint32_t proto, const uint8_t *init, size_t n, uint8_t 
 int mvci_inner_five_baud_init(uint32_t proto, const uint8_t *addr, size_t naddr, uint8_t *inner);
 int mvci_inner_prog_voltage(uint32_t pin, uint32_t voltage, uint8_t *inner);
 int mvci_inner_write_msg(uint32_t proto, const uint8_t *msg, size_t n, uint8_t *inner);
-int mvci_inner_read_poll(uint8_t *inner);
+int mvci_inner_read_poll(uint32_t proto, uint8_t *inner);
 
 /* Pure reply classifiers for the evidenced adapter-only failures. Return 1
  * for the exact captured bytes, 0 otherwise. No other status meaning is
  * proven. */
 int mvci_five_baud_is_disconnected(const uint8_t *resp, int r);
+int mvci_five_baud_is_corolla_success(const uint8_t *resp, int r);
 int mvci_fast_init_is_timeout(const uint8_t *resp, int r);
 /* Pure programming-voltage gate. Returns 1 only for Pin 15 SHORT_TO_GROUND
  * (0xFFFFFFFE). All other pin/value pairs must stay unsupported. */
@@ -117,6 +118,8 @@ int mvci_stop_filter(mvci_ctx_t *ctx, uint32_t msgid);
 int mvci_set_config(mvci_ctx_t *ctx, uint32_t param, uint32_t value);
 int mvci_set_prog_voltage(mvci_ctx_t *ctx, uint32_t pin, uint32_t voltage);
 int mvci_clear_periodic(mvci_ctx_t *ctx);
+/* Clear software and host serial RX queues only. No adapter command. */
+int mvci_clear_rx_buffer(mvci_ctx_t *ctx);
 /* Five-baud init. Returns key byte count (>=0), MVCI_FB_NOT_CONNECTED (-2)
  * for the evidenced OBD-disconnected status reply, or -1 for any other
  * failure. No success wire shape is proven, so any other reply fails closed. */

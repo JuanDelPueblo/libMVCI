@@ -35,6 +35,12 @@ static uint8_t g_asm[MOCK_RAW_MAX + 1];
 static int g_asmlen;
 static uint8_t g_queue[MOCK_QUEUE];
 static int g_qhead, g_qtail;
+static int g_async_reply;
+static uint32_t g_protocol;
+static int g_poll_reply, g_device_reply_pending;
+
+void mock_async_reply(int mode) { g_async_reply = mode; }
+void mock_poll_reply(void) { g_poll_reply = 1; }
 
 const uint8_t *mock_key(void) { return MOCK_KEY; }
 
@@ -64,11 +70,58 @@ static void queue_status(const uint8_t inner[8])
     if (n > 0) queue_bytes(frame, n);
 }
 
+static void queue_pid03_reply(void)
+{
+    static const uint8_t msg[] = {
+        0x10,0x00,0x09,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+        0x48,0x6b,0x10,0x49,0x03,0x04,0x13
+    };
+    uint8_t frame[MVCI_MAX_FRAME];
+    int n = mvci_frame_enc(MOCK_KEY, msg, sizeof msg, frame, sizeof frame);
+    if (n > 0) queue_bytes(frame, n);
+}
+
+static uint32_t get_u32(const uint8_t *p)
+{
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8)
+         | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
 static void answer(const uint8_t *inner, int ilen)
 {
     uint8_t st[8];
     if (ilen < 4) return;
+    if (inner[2] == 0x0a && g_poll_reply) {
+        static const uint8_t ack[8] = { 0x02,0x00,0x0a,0x00,0x00,0x00,0x00,0x00 };
+        g_device_reply_pending = 1;
+        g_poll_reply = 0;
+        queue_status(ack);
+        return;
+    }
+    if (inner[2] == 0x09 && ilen >= 7 && g_device_reply_pending
+            && get_u32(inner + 3) == g_protocol) {
+        g_device_reply_pending = 0;
+        queue_pid03_reply();
+        return;
+    }
+    if (inner[2] == 0x0a && g_async_reply) {
+        /* Synthetic arrival ordering with the captured T002 PID03 payload.
+         * The wire message layout is the existing codec's read-reply shape. */
+        static const uint8_t msg[] = {
+            0x10,0x00,0x09,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+            0x48,0x6b,0x10,0x49,0x03,0x04,0x13
+        };
+        static const uint8_t ack[8] = { 0x02,0x00,0x0a,0x00,0x00,0x00,0x00,0x00 };
+        uint8_t frame[MVCI_MAX_FRAME];
+        int n = mvci_frame_enc(MOCK_KEY, msg, sizeof msg, frame, sizeof frame);
+        if (g_async_reply == 1 && n > 0) queue_bytes(frame, n);
+        queue_status(ack);
+        if (g_async_reply == 2 && n > 0) queue_bytes(frame, n);
+        g_async_reply = 0;
+        return;
+    }
     if (ilen >= 4 && inner[2] == 0x07) {
+        if (ilen >= 7) g_protocol = get_u32(inner + 3);
         static const uint8_t r[8] = { 0x02, 0x00, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00 };
         memcpy(st, r, 8);
     } else if (ilen >= 4 && inner[2] == 0x0b) {
@@ -142,6 +195,9 @@ mvci_io_t *mvci_io_open(const char *port)
     g_nwritten = 0;
     g_asmlen = 0;
     g_qhead = g_qtail = 0;
+    g_async_reply = 0;
+    g_protocol = 0;
+    g_poll_reply = g_device_reply_pending = 0;
     return &g_io;
 }
 

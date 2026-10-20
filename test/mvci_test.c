@@ -153,8 +153,26 @@ static void selftest(void)
         printf("[%s] reject bad checksum\n", ok ? "PASS" : "FAIL");
         ok ? g_pass++ : g_fail++;
     }
+    {
+        static const uint8_t success[] = { 0x03,0x00,0x0e,0x08,0x08,0x00,0x00,0x00 };
+        static const uint8_t other[] = { 0x03,0x00,0x0e,0x08,0x09,0x00,0x00,0x00 };
+        int ok = mvci_five_baud_is_corolla_success(success, 8)
+              && !mvci_five_baud_is_corolla_success(other, 8)
+              && !mvci_five_baud_is_corolla_success(success, 7);
+        printf("[%s] five-baud Corolla success exact reply\n", ok ? "PASS" : "FAIL");
+        ok ? g_pass++ : g_fail++;
+    }
 
     /* ---- operational inner builders vs captured live plaintext ---- */
+    {
+        uint8_t inner[8];
+        static const uint8_t iso9141[] = { 0x05,0x00,0x09,0x03,0x00,0x00,0x00,0x00 };
+        static const uint8_t kwp[] = { 0x05,0x00,0x09,0x04,0x00,0x00,0x00,0x00 };
+        int il = mvci_inner_read_poll(3, inner);
+        check("ISO9141 read poll protocol field", inner, il, iso9141, sizeof iso9141);
+        il = mvci_inner_read_poll(4, inner);
+        check("KWP read poll preserves captured vector", inner, il, kwp, sizeof kwp);
+    }
     {
         uint8_t in[32];
         static const uint8_t exp[] = { 0x0d,0x00,0x07,0x04,0,0,0,0,0x10,0,0,0xa0,0x28,0,0,0 };
