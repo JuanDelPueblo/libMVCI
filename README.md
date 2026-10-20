@@ -87,8 +87,10 @@ physical timing, electrical behavior, or ECU acceptance.
   records, and receive payloads are limited to 64 bytes. Adapter timestamps are
   not established; no timestamp is synthesized from an assumed cable clock. A
   poll still awaiting its reply at a read deadline remains pending across read
-  calls. Other cable commands wait until that reply is classified; a missing
-  reply cannot be recovered by a purge or another poll.
+  calls. Other cable commands wait within their own deadline until that reply
+  is classified. A missing reply poisons the session after 1000 ms from the
+  poll send; this conservative bound is not based on measured cable latency.
+  A purge or another poll cannot recover it.
 - **Filters and clear operations.** Only one-byte PASS filters are supported.
   BLOCK, FLOW_CONTROL, longer descriptors and unsupported flags are refused.
   Stopping a filter frees its slot. Filter clear uses individual stop commands
@@ -97,8 +99,9 @@ physical timing, electrical behavior, or ECU acceptance.
   [filter and clear contracts](docs/filter-and-clear-contracts.md).
 - **Session lifetime and recovery.** A waiting Disconnect or Close cancels a
   read at its next host I/O slice. Messages already delivered are returned;
-  otherwise the read reports `ERR_FAILED`. A canceled poll that had already
-  been sent, a timeout with an outstanding non-poll command, a desync, or an
+  otherwise the read reports `ERR_FAILED`. A fully sent poll keeps its tracked
+  reply and partial frame across cancellation. A timeout with an outstanding
+  non-poll command, a desync, or an
   incomplete Disconnect write leaves an unknown
   result: the session is poisoned and only Close/Open recovers. A purge, quiet
   interval, later clean ACK, or same-session reconnect does not establish

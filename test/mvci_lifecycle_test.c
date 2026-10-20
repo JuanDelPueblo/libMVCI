@@ -685,8 +685,8 @@ static void test_cancel_during_preflight_sends_no_poll(void)
     puts("done: preflight cancel sends no poll");
 }
 
-/* A positive byte is not a reason to ignore cancellation. Stop at the next
- * byte boundary, preserve the fact that the sent poll has an unknown result. */
+/* A positive byte is not a reason to ignore cancellation. The tracked poll
+ * and partial frame survive so Disconnect can classify the exact reply. */
 static void test_cancel_between_positive_reads(void)
 {
     x_reset();
@@ -707,15 +707,14 @@ static void test_cancel_between_positive_reads(void)
     CHECK(dis.rc == 0, "Disconnect after a post-send cancellation");
     int connects = frames_op(0x07);
     J2534_ULONG ch2 = 0;
-    CHECK(PassThruConnect(d, ISO9141, 0x1200, 10400, &ch2) != 0 && ch2 == 0,
-          "cancel after sending preserves the poisoned session");
-    CHECK(frames_op(0x07) == connects, "poisoned reconnect sends no Connect command");
+    CHECK(PassThruConnect(d, ISO9141, 0x1200, 10400, &ch2) == 0 && ch2 != ch,
+          "resolved poll permits reconnect after Disconnect");
+    CHECK(frames_op(0x07) == connects + 1, "clean reconnect sends one Connect command");
     close_dev(d);
-    puts("done: positive-read cancellation poisons sent poll");
+    puts("done: positive-read cancellation retains tracked poll");
 }
 
-/* Cancel after the read poll was sent: its result is unknown, so the context
- * stays poisoned past a clean Disconnect. Only Close/Open recovers. */
+/* A missing poll reply cannot be purged at Disconnect. Close/Open recovers. */
 static void test_disconnect_after_ambiguous_cancel(void)
 {
     x_reset();
@@ -728,7 +727,7 @@ static void test_disconnect_after_ambiguous_cancel(void)
     job_start(&x, J_DISCONNECT, ch);
     grant_slices_until_done(&x);
     job_join(&r); job_join(&x);
-    CHECK(x.rc == 0, "Disconnect returned and was acknowledged cleanly");
+    CHECK(x.rc == ERR_FAILED, "Disconnect refuses to purge a missing poll reply");
     CHECK(r.rc == ERR_FAILED && r.n == 0, "the canceled read reports no messages");
     int connects = frames_op(0x07);
     T_lock(); X.mute_op = -1; X.gate_reads = 0; T_unlock();
@@ -741,7 +740,7 @@ static void test_disconnect_after_ambiguous_cancel(void)
     J2534_ULONG ch3 = connect_dev(d2);
     CHECK(ch3 != ch, "Close/Open recovers with a new channel handle");
     close_dev(d2);
-    puts("done: ambiguous cancel keeps the session poisoned");
+    puts("done: missing poll reply blocks teardown until Close/Open");
 }
 
 /* Cancel with no command outstanding (a partial unsolicited frame): the

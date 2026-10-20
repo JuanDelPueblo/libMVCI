@@ -41,6 +41,10 @@ static int reject_op, reject_at, op_calls, drop_op, lost, chunk;
 static int tx_delay, read_wait, async_len, async_count, bad_poll;
 static int tx_budget, lock_busy, init_success;
 static int poll_calls, poll_missing_after;
+static int delayed_poll_num, delayed_poll_ms, delayed_data, delayed_split;
+static uint8_t delayed_frame[MVCI_MAX_FRAME];
+static int delayed_len, delayed_pos;
+static uint64_t delayed_ready_ns;
 static int rx_stream, stream_generated, immediate_reads, max_read_timeout;
 static uint64_t immediate_ns;
 int __real_pthread_mutex_trylock(pthread_mutex_t *);
@@ -55,6 +59,20 @@ int mvci_io_read(mvci_io_t *io, uint8_t *buf, int n, int timeout_ms)
     assert(timeout_ms >= 0);
     if (lost) return -1;
     if (timeout_ms > max_read_timeout) max_read_timeout = timeout_ms;
+    if (delayed_len && g_qhead == g_qtail) {
+        uint64_t end = clock_ns + (uint64_t)timeout_ms * 1000000;
+        if (clock_ns < delayed_ready_ns) {
+            if (timeout_ms && end >= delayed_ready_ns) clock_ns = delayed_ready_ns;
+            else if (timeout_ms) clock_ns = end;
+        }
+        if (clock_ns >= delayed_ready_ns) {
+            int take = delayed_split && delayed_pos == 0 ? delayed_split : delayed_len - delayed_pos;
+            queue_bytes(delayed_frame + delayed_pos, take);
+            delayed_pos += take;
+            if (delayed_pos == delayed_len) delayed_len = delayed_pos = 0;
+            else delayed_ready_ns = clock_ns + 5000000;
+        }
+    }
     if (rx_stream && g_qhead == g_qtail) {
         /* An infinite source: the public call must stop itself. The guard
          * fails the test instead of injecting EOF to make the call return. */
@@ -70,7 +88,7 @@ int mvci_io_read(mvci_io_t *io, uint8_t *buf, int n, int timeout_ms)
         ++immediate_reads;
         clock_ns += immediate_ns;
     }
-    if (!r && read_wait) clock_ns += (uint64_t)timeout_ms * 1000000;
+    if (!r && read_wait && !delayed_len) clock_ns += (uint64_t)timeout_ms * 1000000;
     return r;
 }
 int mvci_io_write(mvci_io_t *io, const uint8_t *buf, int n)
@@ -105,8 +123,24 @@ int mvci_io_write_timeout(mvci_io_t *io, const uint8_t *buf, int n, int timeout_
         uint8_t status[8] = {2, 0, 9, 8};
         queue_status(status);
     }
-    if (op == 9 && poll_missing_after && ++poll_calls == poll_missing_after)
-        mvci_io_purge_rx(io);
+    if (op == 9) {
+        ++poll_calls;
+        if (poll_missing_after && poll_calls == poll_missing_after)
+            mvci_io_purge_rx(io);
+        if (delayed_poll_num && poll_calls == delayed_poll_num) {
+            if (delayed_data) {
+                static const uint8_t data[5] = {0x48, 0x6b, 0x10, 0x49, 0x09};
+                mvci_io_purge_rx(io);
+                mock_rx_record(data, sizeof data, 0);
+            }
+            delayed_len = g_qtail - g_qhead;
+            assert(delayed_len > 0 && delayed_len <= (int)sizeof delayed_frame);
+            memcpy(delayed_frame, g_queue + g_qhead, (size_t)delayed_len);
+            g_qhead = g_qtail = 0;
+            delayed_pos = 0;
+            delayed_ready_ns = clock_ns + (uint64_t)delayed_poll_ms * 1000000;
+        }
+    }
     if (op == 0x0a && async_count) {
         mvci_io_purge_rx(io);
         for (int i = 0; i < async_count; i++) mock_rx_record(extra_data, async_len, 0);
@@ -125,6 +159,7 @@ static void start(void)
     immediate_ns = 0;
     lock_busy = init_success = 0;
     poll_calls = poll_missing_after = 0;
+    delayed_poll_num = delayed_poll_ms = delayed_data = delayed_split = delayed_len = delayed_pos = 0;
     reject_at = op_calls = lost = chunk = tx_delay = read_wait = async_count = bad_poll = 0;
     assert(PassThruOpen((void *)"script-only", &device) == 0);
     assert(PassThruConnect(device, ISO9141, 0x1200, 10400, &channel) == 0);
@@ -271,39 +306,89 @@ static void test_read_deadlines_and_errors(void)
 }
 static void test_pending_poll_across_public_deadlines(void)
 {
-    start();
-    J2534_ULONG n = 1;
-    assert(PassThruWriteMsgs(channel, messages, &n, 20) == 0 && n == 1);
-    poll_missing_after = 3;
-    read_wait = 1;
-    uint64_t began = clock_ns;
-    n = 1;
+    for (int delay = 5; delay <= 60; ++delay) {
+        start(); delayed_poll_num = 1; delayed_poll_ms = delay; read_wait = 1;
+        J2534_ULONG count = 1;
+        assert(PassThruReadMsgs(channel, received, &count, 20) == ERR_TIMEOUT && count == 0);
+        count = 1;
+        assert(PassThruWriteMsgs(channel, messages, &count, 100) == 0 && count == 1);
+        assert(config() == 0);
+        stop();
+    }
+    /* The virtual transport releases a real framed reply only at ready time.
+     * Each public operation must resolve it before sending or purging. */
+    for (int operation = 0; operation < 4; ++operation) {
+        start(); delayed_poll_num = 1; delayed_poll_ms = 35; read_wait = 1;
+        J2534_ULONG n = 1;
+        assert(PassThruReadMsgs(channel, received, &n, 20) == ERR_TIMEOUT && n == 0);
+        int before = mock_frame_count();
+        if (operation == 0) {
+            n = 1;
+            long wr = PassThruWriteMsgs(channel, messages, &n, 50);
+            assert(wr == 0 && n == 1);
+            assert(mock_frame_count() == before + 1);
+        } else if (operation == 1) {
+            assert(config() == 0 && mock_frame_count() == before + 1);
+        } else if (operation == 2) {
+            assert(PassThruIoctl(channel, CLEAR_RX_BUFFER, NULL, NULL) == 0);
+            assert(mock_frame_count() == before);
+        } else {
+            assert(PassThruDisconnect(channel) == 0);
+            assert(mock_frame_count() == before + 1);
+        }
+        stop();
+    }
+
+    start(); delayed_poll_num = 1; delayed_poll_ms = 38; delayed_data = 1; read_wait = 1;
+    J2534_ULONG n = 2;
     assert(PassThruReadMsgs(channel, received, &n, 20) == ERR_TIMEOUT && n == 0);
-    assert(clock_ns - began == 20000000 && poll_calls == 3);
     int before = mock_frame_count();
     n = 1;
-    assert(PassThruWriteMsgs(channel, messages, &n, 20) == ERR_FAILED && n == 0);
-    assert(config() == ERR_FAILED);
-    assert(PassThruIoctl(channel, CLEAR_RX_BUFFER, NULL, NULL) == ERR_FAILED);
-    assert(PassThruDisconnect(channel) == ERR_FAILED);
-    assert(mock_frame_count() == before);
+    assert(PassThruReadMsgs(channel, received, &n, 7) == ERR_TIMEOUT && n == 0);
+    assert(mock_frame_count() == before); /* two deadlines, one poll */
+    n = 2;
+    assert(PassThruReadMsgs(channel, received, &n, 20) == ERR_TIMEOUT && n == 1);
+    assert(received[0].DataSize == 5 && mock_frame_count() >= before + 1);
+    stop();
+
+    start(); delayed_poll_num = 1; delayed_poll_ms = 18; delayed_data = 1;
+    delayed_split = 4; read_wait = 1;
+    n = 1;
+    assert(PassThruReadMsgs(channel, received, &n, 20) == ERR_TIMEOUT && n == 0);
+    before = mock_frame_count();
     n = 1;
     assert(PassThruReadMsgs(channel, received, &n, 0) == ERR_BUFFER_EMPTY && n == 0);
     assert(mock_frame_count() == before);
-    began = clock_ns; n = 1;
-    assert(PassThruReadMsgs(channel, received, &n, 7) == ERR_TIMEOUT && n == 0);
-    assert(clock_ns - began == 7000000 && mock_frame_count() == before);
-    const uint8_t late[] = {0x48, 0x6b, 0x10, 0x49, 0x09};
-    mock_rx_record(late, sizeof late, 0);
+    n = 1;
+    assert(PassThruReadMsgs(channel, received, &n, 20) == 0 && n == 1);
+    assert(received[0].DataSize == 5 && mock_frame_count() == before);
+    stop();
+
+    start(); delayed_poll_num = 1; delayed_poll_ms = 22; delayed_data = 1; read_wait = 1;
+    n = 1;
+    assert(PassThruReadMsgs(channel, received, &n, 20) == ERR_TIMEOUT && n == 0);
+    before = mock_frame_count();
+    clock_ns += 3000000;
     n = 1;
     assert(PassThruReadMsgs(channel, received, &n, 0) == 0 && n == 1);
-    assert(received[0].DataSize == sizeof late &&
-           memcmp(received[0].Data, late, sizeof late) == 0);
-    assert(mock_frame_count() == before);
-    assert(config() == 0);
-    n = 1;
-    assert(PassThruWriteMsgs(channel, messages, &n, 20) == 0 && n == 1);
+    assert(received[0].DataSize == 5 && mock_frame_count() == before);
     stop();
+
+    start(); delayed_poll_num = 1; delayed_poll_ms = 30; read_wait = 1;
+    n = 1;
+    assert(PassThruReadMsgs(channel, received, &n, 20) == ERR_TIMEOUT && n == 0);
+    before = mock_frame_count();
+    assert(PassThruClose(device) == 0);
+    assert(mock_frame_count() == before + 1); /* exact teardown was sent */
+
+    start(); poll_missing_after = 1; read_wait = 1;
+    n = 1;
+    assert(PassThruReadMsgs(channel, received, &n, 20) == ERR_TIMEOUT && n == 0);
+    before = mock_frame_count();
+    clock_ns += 1001000000;
+    assert(config() == ERR_FAILED && mock_frame_count() == before);
+    stop();
+    start(); assert(config() == 0); stop();
 
     start(); drop_op = 9; read_wait = 1;
     n = 1;
@@ -316,7 +401,7 @@ static void test_pending_poll_across_public_deadlines(void)
     assert(PassThruWriteMsgs(channel, messages, &n, 20) == ERR_FAILED && n == 0);
     assert(mock_frame_count() == before);
     stop();
-    puts("PASS: delayed poll reply survives read deadline; commands wait for correlation");
+    puts("PASS: delayed and split poll replies retain ordering; missing reply poisons after age cap");
 }
 static void test_fragments_bounds_and_overflow(void)
 {
