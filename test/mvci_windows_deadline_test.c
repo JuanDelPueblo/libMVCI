@@ -60,7 +60,7 @@ int main(void)
  memcpy(msg.Data,"\x68\x6a\xf1\x01\x00",5);
  setup_ms=7;offered_at=UINT32_MAX;ULONG began=g_now;int before=mock_frame_count();
  long rc=PassThruWriteMsgs(ch,&msg,&count,5);
- printf("public_WriteMsgs budget=5 setup=7 rc=%ld count=%u elapsed=%u offered_at=%u frames=%d\n",rc,count,g_now-began,offered_at-began,mock_frame_count()-before);
+ printf("public_WriteMsgs budget=5 setup=7 rc=%ld count=%u elapsed=%u offered=%d frames=%d\n",rc,count,g_now-began,offered_at!=UINT32_MAX,mock_frame_count()-before);
  assert(rc==ERR_TIMEOUT && count==0 && offered_at==UINT32_MAX && mock_frame_count()==before);
  count=1;before=mock_frame_count();
  assert(PassThruWriteMsgs(ch,&msg,&count,5)==ERR_FAILED && count==0 && mock_frame_count()==before);
