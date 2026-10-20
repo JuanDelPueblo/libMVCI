@@ -42,6 +42,8 @@ static uint8_t g_config_status;
 static int g_five_baud_success;
 static int g_fast_reply_len;
 static int g_fast_reply_enabled;
+static int g_handshake_shape;
+void mock_handshake_shape(int mode) { g_handshake_shape = mode; }
 
 void mock_async_reply(int mode) { g_async_reply = mode; }
 void mock_poll_reply(void) { g_poll_reply = 1; }
@@ -211,11 +213,18 @@ static void on_frame(const uint8_t *f, int n)
     if (n == 3 && f[0] == 0x03) return;   /* reset: no reply */
     if (n == 12 && f[2] == 0x07 && f[3] == 0x00 && f[4] == 0x01) {
         /* identify: issue the fixed challenge */
-        uint8_t pl[11] = { 0x09, 0x00, 0x01,
+        uint8_t pl[12] = { 0x09, 0x00, 0x01,
                             MOCK_KEY[0], MOCK_KEY[1], MOCK_KEY[2], MOCK_KEY[3],
                             MOCK_KEY[4], MOCK_KEY[5], MOCK_KEY[6], MOCK_KEY[7] };
         uint8_t frame[MVCI_MAX_FRAME];
-        int m = mvci_frame_plain(pl, sizeof pl, frame, sizeof frame);
+        size_t plen = 11;
+        if (g_handshake_shape == 1) pl[1] = 0x7f;
+        if (g_handshake_shape == 2) pl[2] = 0x7f;
+        if (g_handshake_shape == 3) plen = 10;
+        if (g_handshake_shape == 4) plen = 12;
+        if (g_handshake_shape == 5) pl[0] = 8;
+        g_handshake_shape = 0;
+        int m = mvci_frame_plain(pl, plen, frame, sizeof frame);
         if (m > 0) queue_bytes(frame, m);
         return;
     }

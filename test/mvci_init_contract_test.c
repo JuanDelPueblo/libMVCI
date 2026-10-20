@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <string.h>
 void mock_five_baud_success(int enabled);
+void mock_handshake_shape(int mode);
 void mock_fast_reply_length(int length);
 int mock_frame_count(void);
 static int failures;
@@ -41,6 +42,16 @@ int main(void)
     CHECK(PassThruIoctl(ch, FAST_INIT, NULL, &fo) == ERR_NOT_SUPPORTED);
     CHECK(mock_frame_count() == before);
     CHECK(PassThruDisconnect(ch) == STATUS_NOERROR);
+    CHECK(PassThruClose(dev) == STATUS_NOERROR);
+    /* A checksum alone cannot validate an identify challenge. Never expose a
+     * device or install a key from an unsupported header or payload length. */
+    for (int mode = 1; mode <= 5; mode++) {
+        dev = 0xdeadbeef;
+        mock_handshake_shape(mode);
+        CHECK(PassThruOpen((void *)"mock", &dev) == ERR_DEVICE_NOT_CONNECTED);
+        CHECK(dev == 0xdeadbeef);
+    }
+    CHECK(PassThruOpen((void *)"mock", &dev) == STATUS_NOERROR);
     CHECK(PassThruClose(dev) == STATUS_NOERROR);
     return failures ? 1 : 0;
 }

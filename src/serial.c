@@ -410,7 +410,7 @@ static int do_handshake(mvci_ctx_t *ctx)
 
     const uint8_t *pl;
     int plen = mvci_frame_payload(frame, n, &pl);
-    if (plen < 3 + 8 || pl[0] != 0x09) return -1;
+    if (plen != 11 || pl[0] != 0x09 || pl[1] != 0 || pl[2] != 1) return -1;
     memcpy(ctx->key, pl + 3, 8);
     ctx->have_key = 1;
     return 0;
