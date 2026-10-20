@@ -45,6 +45,7 @@ typedef FT_STATUS (WINAPI *PFN_Chars)(FT_HANDLE, UCHAR, UCHAR, UCHAR);
 typedef FT_STATUS (WINAPI *PFN_Flow)(FT_HANDLE, USHORT, UCHAR, UCHAR);
 typedef FT_STATUS (WINAPI *PFN_Lat)(FT_HANDLE, UCHAR);
 typedef FT_STATUS (WINAPI *PFN_RW)(FT_HANDLE, LPVOID, DWORD, LPDWORD);
+typedef FT_STATUS (WINAPI *PFN_Q)(FT_HANDLE, LPDWORD);
 
 static struct {
     HMODULE  dll;
@@ -56,6 +57,7 @@ static struct {
     PFN_Flow SetFlowControl;
     PFN_Lat  SetLatencyTimer;
     PFN_RW   Write, Read;
+    PFN_Q    GetQueueStatus;
 } FT;
 
 static int ft_load(void)
@@ -78,11 +80,12 @@ static int ft_load(void)
     FT.SetLatencyTimer        = (PFN_Lat)  GetProcAddress(m, "FT_SetLatencyTimer");
     FT.Write                  = (PFN_RW)   GetProcAddress(m, "FT_Write");
     FT.Read                   = (PFN_RW)   GetProcAddress(m, "FT_Read");
+    FT.GetQueueStatus         = (PFN_Q)    GetProcAddress(m, "FT_GetQueueStatus");
 
     if (!FT.OpenEx || !FT.Close || !FT.ResetDevice || !FT.ClrRts || !FT.SetDtr ||
         !FT.ClrDtr || !FT.SetBaudRate || !FT.Purge || !FT.SetTimeouts ||
         !FT.SetDataCharacteristics || !FT.SetFlowControl || !FT.SetLatencyTimer ||
-        !FT.Write || !FT.Read) {
+        !FT.Write || !FT.Read || !FT.GetQueueStatus) {
         FreeLibrary(m);
         return -1;
     }
@@ -93,7 +96,7 @@ static int ft_load(void)
 /* purge_failed: mvci_io_purge_rx() returns void, so a failed purge is kept here
  * and fails reads and writes until a later purge succeeds, instead of leaving
  * stale bytes to be framed. */
-struct mvci_io { FT_HANDLE h; int purge_failed; };
+struct mvci_io { FT_HANDLE h; int purge_failed; ULONG rd_ms, wr_ms; };
 
 #define FT_TRY(call)  do { if ((call) != FT_OK) goto fail; } while (0)
 
@@ -115,6 +118,8 @@ mvci_io_t *mvci_io_open(const char *port)
     FT_TRY(FT.SetFlowControl(io->h, FT_FLOW_NONE, 0, 0));
     FT_TRY(FT.SetLatencyTimer(io->h, 2));
     FT_TRY(FT.SetTimeouts(io->h, 100, 1000));   /* default rx/tx ms */
+    io->rd_ms = 100;
+    io->wr_ms = 1000;
 
     FT_TRY(FT.ResetDevice(io->h));
     FT_TRY(FT.Purge(io->h, FT_PURGE_RX));
@@ -143,25 +148,49 @@ void mvci_io_close(mvci_io_t *io)
     free(io);
 }
 
-int mvci_io_write(mvci_io_t *io, const uint8_t *buf, int n)
+/* D2XX documents no value for a timeout of 0 (the D2XX Programmer's Guide, v1.5,
+ * describes FT_SetTimeouts only as "in milliseconds"), so 0 is never passed.
+ * FT_Write has no documented nonblocking mode and reports a write timeout only
+ * as a short count (FT_OK, written < n). The count is host acceptance, not wire
+ * transmission. A failed status is -1 even when bytes were accepted: the caller
+ * must treat that write as ambiguous. This function never retries. */
+int mvci_io_write_timeout(mvci_io_t *io, const uint8_t *buf, int n, int timeout_ms)
 {
     DWORD written = 0;
-    if (!io || n < 0 || (n > 0 && !buf) || io->purge_failed) return -1;
+    if (!io || n < 0 || (n > 0 && !buf) || timeout_ms < 0 || io->purge_failed) return -1;
     if (n == 0) return 0;
-    /* A short count is the D2XX write timeout: report it, never retry here. */
+    /* No documented way to offer bytes without a wait: accept none. */
+    if (timeout_ms == 0) return 0;
+    if (FT.SetTimeouts(io->h, io->rd_ms, (ULONG)timeout_ms) != FT_OK) return -1;
+    io->wr_ms = (ULONG)timeout_ms;
     if (FT.Write(io->h, (LPVOID)buf, (DWORD)n, &written) != FT_OK) return -1;
-    return written == (DWORD)n ? n : -1;
+    return written <= (DWORD)n ? (int)written : -1;
 }
 
+int mvci_io_write(mvci_io_t *io, const uint8_t *buf, int n)
+{
+    int written = mvci_io_write_timeout(io, buf, n, 1000);
+    return written == n ? n : -1;
+}
+
+/* timeout_ms == 0 drains only what the receive queue already holds: the guide
+ * documents that FT_Read returns at once when asked for no more than
+ * FT_GetQueueStatus reports, so no D2XX timeout is involved. */
 int mvci_io_read(mvci_io_t *io, uint8_t *buf, int n, int timeout_ms)
 {
     DWORD got = 0;
-    if (!io || n < 0 || (n > 0 && !buf) || io->purge_failed) return -1;
+    if (!io || n < 0 || (n > 0 && !buf) || timeout_ms < 0 || io->purge_failed) return -1;
     if (n == 0) return 0;
-    /* A read timeout of 0 may mean "wait forever" in D2XX, and a negative value
-     * would become a huge ULONG: always pass at least 1 ms. */
-    if (timeout_ms < 1) timeout_ms = 1;
-    if (FT.SetTimeouts(io->h, (ULONG)timeout_ms, 1000) != FT_OK) return -1;
+    if (timeout_ms == 0) {
+        DWORD queued = 0;
+        if (FT.GetQueueStatus(io->h, &queued) != FT_OK) return -1;
+        if (queued == 0) return 0;
+        if (queued > (DWORD)n) queued = (DWORD)n;
+        if (FT.Read(io->h, buf, queued, &got) != FT_OK) return -1;
+        return got <= queued ? (int)got : -1;
+    }
+    if (FT.SetTimeouts(io->h, (ULONG)timeout_ms, io->wr_ms) != FT_OK) return -1;
+    io->rd_ms = (ULONG)timeout_ms;
     if (FT.Read(io->h, buf, (DWORD)n, &got) != FT_OK) return -1;
     return got <= (DWORD)n ? (int)got : -1;     /* got < n is a timeout */
 }

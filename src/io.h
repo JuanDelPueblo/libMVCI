@@ -22,10 +22,14 @@ void       mvci_io_close(mvci_io_t *io);
 int  mvci_io_write(mvci_io_t *io, const uint8_t *buf, int n);
 
 /* Deadline-aware write: returns bytes accepted (possibly partial), or -1.
- * timeout_ms=0 never waits. Acceptance is host I/O, not physical transmission. */
+ * timeout_ms=0 never waits. Acceptance is host I/O, not physical transmission.
+ * POSIX offers the bytes once without waiting. Windows (D2XX has no documented
+ * nonblocking write) accepts none and returns 0. A status failure returns -1
+ * even if some bytes were accepted; callers treat that write as ambiguous. */
 int mvci_io_write_timeout(mvci_io_t *io, const uint8_t *buf, int n, int timeout_ms);
 
-/* read up to n bytes within timeout_ms; returns bytes read (may be < n) or -1 */
+/* read up to n bytes within timeout_ms; returns bytes read (may be < n) or -1.
+ * timeout_ms=0 returns only bytes already queued and never waits; < 0 is -1. */
 int  mvci_io_read(mvci_io_t *io, uint8_t *buf, int n, int timeout_ms);
 
 /* discard any buffered input */
