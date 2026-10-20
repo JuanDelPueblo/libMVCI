@@ -527,7 +527,7 @@ int mvci_keepalive(mvci_ctx_t *ctx)
     static const uint8_t ka[8] = { 0x05, 0x00, 0x09, 0x06, 0x00, 0x00, 0x00, 0x00 };
     uint8_t resp[32];
     int r = mvci_transact(ctx, ka, sizeof ka, resp, sizeof resp, 500);
-    return r > 0 ? 0 : -1;
+    return ack_ok(resp, r, 0x09) ? 0 : -1;
 }
 
 static MVCI_THREAD_RET keepalive_thread(void *arg)
@@ -700,7 +700,7 @@ int mvci_write_msg_timeout(mvci_ctx_t *ctx, const uint8_t *msg, size_t n, int ti
 
 int mvci_write_msg(mvci_ctx_t *ctx, const uint8_t *msg, size_t n)
 {
-    return mvci_write_msg_timeout(ctx, msg, n, 1000);
+    return mvci_write_msg_timeout(ctx, msg, n, 1000) == 0 ? 0 : -1;
 }
 
 int mvci_poll(mvci_ctx_t *ctx, uint8_t *msg_out, size_t cap,

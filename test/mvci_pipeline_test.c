@@ -162,6 +162,11 @@ static void test_ack_results(void)
     assert(PassThruIoctl(channel, FIVE_BAUD_INIT, &in, &out) == 0);
     assert(out.NumOfBytes == 2 && keys[0] == 8 && keys[1] == 8);
     stop();
+    reject_op = 9; reject_at = 1; op_calls = 0;
+    mvci_ctx_t *ctx = mvci_open("script-only");
+    assert(ctx && mvci_handshake(ctx) == 0);
+    assert(mvci_keepalive(ctx) == -1);
+    mvci_close(ctx);
     puts("PASS: nonzero ACK results propagate; exact Corolla init success remains distinct");
 }
 static void test_stale_ack_and_timeout(void)
