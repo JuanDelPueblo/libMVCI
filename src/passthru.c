@@ -40,8 +40,9 @@ typedef struct {
     mvci_ctx_t  *ctx;
     uint32_t     proto;
     uint32_t     loopback;       /* host delivery policy, not a cable read-back */
-    uint32_t     next_id;        /* filter/msg id generator */
-    uint32_t     filter_msg[MAX_FILTERS];  /* device msgid by (FilterID-1), 0 = free */
+    uint32_t     next_id;        /* public filter id generator; 0 = exhausted */
+    uint32_t     filter_msg[MAX_FILTERS];  /* device msgid by slot, 0 = free */
+    uint32_t     filter_id[MAX_FILTERS];   /* public id, separate from device handle */
 } slot_t;
 
 static slot_t       g_slot[MAX_SLOTS];
@@ -183,21 +184,53 @@ J2534_LONG J2534_API PassThruStartMsgFilter(J2534_ULONG ChannelID, J2534_ULONG F
                                       PASSTHRU_MSG *pFlowControlMsg, J2534_ULONG *pFilterID)
 {
     ensure_init();
-    (void)FilterType; (void)pFlowControlMsg;
     slot_t *s = ch_slot(ChannelID);
     if (!s || !s->connected) { set_err("invalid channel id"); return ERR_INVALID_CHANNEL_ID; }
     if (!pMaskMsg || !pPatternMsg || !pFilterID) { set_err("NULL filter msg"); return ERR_NULL_PARAMETER; }
-
-    uint8_t mask    = pMaskMsg->DataSize    ? pMaskMsg->Data[0]    : 0;
-    uint8_t pattern = pPatternMsg->DataSize ? pPatternMsg->Data[0] : 0;
-    if (s->next_id == 0 || s->next_id > MAX_FILTERS) { set_err("too many filters"); return ERR_FAILED; }
-    uint32_t msgid  = 0x000e7a00u + (s->next_id & 0xff);    /* device-style handle */
+    /* Only the one-byte PASS wire form is evidenced. Never turn a request
+     * for another type, length or flags into a less restrictive filter. */
+    if (FilterType != PASS_FILTER) {
+        set_err("only one-byte PASS filters are supported");
+        return ERR_NOT_SUPPORTED;
+    }
+    if (pFlowControlMsg || !pMaskMsg->DataSize ||
+        pMaskMsg->DataSize != pPatternMsg->DataSize) {
+        set_err("invalid filter messages");
+        return ERR_INVALID_MSG;
+    }
+    if (pMaskMsg->DataSize != 1) {
+        set_err("only one-byte PASS filters are supported");
+        return ERR_NOT_SUPPORTED;
+    }
+    /* Retain the existing zero-initialized descriptor form. An explicit
+     * ProtocolID must match the channel, and the two descriptors must agree. */
+    if (pMaskMsg->ProtocolID != pPatternMsg->ProtocolID ||
+        (pMaskMsg->ProtocolID && pMaskMsg->ProtocolID != s->proto)) {
+        set_err("filter protocol does not match channel");
+        return ERR_MSG_PROTOCOL_ID;
+    }
+    if (pMaskMsg->TxFlags || pPatternMsg->TxFlags) {
+        set_err("filter flags are not supported");
+        return ERR_INVALID_FLAGS;
+    }
+    int slot = -1;
+    for (int i = 0; i < MAX_FILTERS; i++)
+        if (!s->filter_msg[i]) { slot = i; break; }
+    if (slot < 0 || !s->next_id) {
+        set_err("filter capacity exceeded");
+        return ERR_EXCEEDED_LIMIT;
+    }
+    /* Reuse an inactive device-handle slot, but give it a new public ID so
+     * a stale StopMsgFilter cannot stop its replacement in this session. */
+    uint32_t msgid = 0x000e7a01u + (uint32_t)slot;
+    uint8_t mask = pMaskMsg->Data[0], pattern = pPatternMsg->Data[0];
 
     if (mvci_start_filter(s->ctx, msgid, mask, pattern) != 0) {
         set_err("start filter failed");
         return ERR_FAILED;
     }
-    s->filter_msg[s->next_id - 1] = msgid;
+    s->filter_msg[slot] = msgid;
+    s->filter_id[slot] = s->next_id;
     *pFilterID = s->next_id++;
     return STATUS_NOERROR;
 }
@@ -209,15 +242,19 @@ J2534_LONG J2534_API PassThruStopMsgFilter(J2534_ULONG ChannelID, J2534_ULONG Fi
     if (!s || !s->connected) { set_err("invalid channel id"); return ERR_INVALID_CHANNEL_ID; }
     /* Forward the vendor-evidenced stop-filter command (T255 frames 504/522)
      * with the same device handle the start-filter command carried. */
-    if (FilterID == 0 || FilterID > MAX_FILTERS || s->filter_msg[FilterID - 1] == 0) {
+    int slot = -1;
+    for (int i = 0; i < MAX_FILTERS; i++)
+        if (s->filter_msg[i] && s->filter_id[i] == FilterID) { slot = i; break; }
+    if (slot < 0) {
         set_err("invalid filter id");
         return ERR_INVALID_FILTER_ID;
     }
-    if (mvci_stop_filter(s->ctx, s->filter_msg[FilterID - 1]) != 0) {
+    if (mvci_stop_filter(s->ctx, s->filter_msg[slot]) != 0) {
         set_err("stop filter failed");
         return ERR_FAILED;
     }
-    s->filter_msg[FilterID - 1] = 0;
+    s->filter_msg[slot] = 0;
+    s->filter_id[slot] = 0;
     return STATUS_NOERROR;
 }
 
@@ -282,13 +319,22 @@ J2534_LONG J2534_API PassThruIoctl(J2534_ULONG ChannelID, J2534_ULONG IoctlID,
                              void *pInput, void *pOutput)
 {
     ensure_init();
+    /* Voltage reads use a device handle, even though they remain unsupported.
+     * Every implemented IOCTL below requires a live channel handle. */
+    if (IoctlID == READ_VBATT || IoctlID == READ_PROG_VOLTAGE) {
+        if (!dev_slot(ChannelID)) {
+            set_err("invalid device id");
+            return ERR_INVALID_DEVICE_ID;
+        }
+        set_err("voltage read is not supported");
+        return ERR_NOT_SUPPORTED;
+    }
     slot_t *s = ch_slot(ChannelID);
-    if (!s) { set_err("invalid channel id"); return ERR_INVALID_CHANNEL_ID; }
+    if (!s || !s->connected) { set_err("invalid channel id"); return ERR_INVALID_CHANNEL_ID; }
 
     switch (IoctlID) {
     case GET_CONFIG: {
         SCONFIG_LIST *list = (SCONFIG_LIST *)pInput;
-        if (!s->connected) return ERR_INVALID_CHANNEL_ID;
         if (!list || (list->NumOfParams && !list->ConfigPtr)) return ERR_NULL_PARAMETER;
         /* There is no evidenced cable GET command. A SET acknowledgement is
          * not proof that firmware applied a timing parameter. Only report the
@@ -313,7 +359,6 @@ J2534_LONG J2534_API PassThruIoctl(J2534_ULONG ChannelID, J2534_ULONG IoctlID,
     }
     case SET_CONFIG: {
         SCONFIG_LIST *list = (SCONFIG_LIST *)pInput;
-        if (!s->connected) return ERR_INVALID_CHANNEL_ID;
         if (!list || (list->NumOfParams && !list->ConfigPtr)) return ERR_NULL_PARAMETER;
         for (uint32_t i = 0; i < list->NumOfParams; i++)
             if (list->ConfigPtr[i].Parameter == LOOPBACK && list->ConfigPtr[i].Value > 1) {
@@ -336,13 +381,39 @@ J2534_LONG J2534_API PassThruIoctl(J2534_ULONG ChannelID, J2534_ULONG IoctlID,
         return STATUS_NOERROR;
     }
     case CLEAR_PERIODIC_MSGS:
-        return mvci_clear_periodic(s->ctx) == 0 ? STATUS_NOERROR : ERR_FAILED;
+        if (mvci_clear_periodic(s->ctx) != 0) {
+            set_err("clear periodic messages failed");
+            return ERR_FAILED;
+        }
+        return STATUS_NOERROR;
 
     case CLEAR_RX_BUFFER:
-        return mvci_clear_rx_buffer(s->ctx) == 0 ? STATUS_NOERROR : ERR_FAILED;
+        /* Software and host serial RX only; no cable mailbox clear is known. */
+        if (mvci_clear_rx_buffer(s->ctx) != 0) {
+            set_err("clear host RX buffer failed");
+            return ERR_FAILED;
+        }
+        return STATUS_NOERROR;
 
     case CLEAR_TX_BUFFER:
+        /* There is no host TX queue or evidenced cable cancellation command.
+         * An acknowledged write does not prove the cable has finished TX. */
+        set_err("TX clear unsupported: cable cancellation is unknown");
+        return ERR_NOT_SUPPORTED;
+
     case CLEAR_MSG_FILTERS:
+        /* Use the existing stop operation, not a guessed bulk-clear opcode.
+         * Commit each successful stop. Keep the failed and unvisited entries
+         * active so a later retry can address the exact same device handles. */
+        for (int i = 0; i < MAX_FILTERS; i++) {
+            if (!s->filter_msg[i]) continue;
+            if (mvci_stop_filter(s->ctx, s->filter_msg[i]) != 0) {
+                set_err("clear filters failed; remaining filters retained");
+                return ERR_FAILED;
+            }
+            s->filter_msg[i] = 0;
+            s->filter_id[i] = 0;
+        }
         return STATUS_NOERROR;
 
     case FAST_INIT: {
