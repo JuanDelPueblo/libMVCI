@@ -387,7 +387,10 @@ J2534_LONG J2534_API PassThruIoctl(J2534_ULONG ChannelID, J2534_ULONG IoctlID,
     switch (IoctlID) {
     case GET_CONFIG: {
         SCONFIG_LIST *list = (SCONFIG_LIST *)pInput;
-        if (!list || (list->NumOfParams && !list->ConfigPtr)) return ERR_NULL_PARAMETER;
+        if (!list || (list->NumOfParams && !list->ConfigPtr)) {
+            set_err("NULL configuration list or parameter array");
+            return ERR_NULL_PARAMETER;
+        }
         /* There is no evidenced cable GET command. A SET acknowledgement is
          * not proof that firmware applied a timing parameter. Only report the
          * LOOPBACK policy enforced by this driver's read path. Validate the
@@ -411,7 +414,10 @@ J2534_LONG J2534_API PassThruIoctl(J2534_ULONG ChannelID, J2534_ULONG IoctlID,
     }
     case SET_CONFIG: {
         SCONFIG_LIST *list = (SCONFIG_LIST *)pInput;
-        if (!list || (list->NumOfParams && !list->ConfigPtr)) return ERR_NULL_PARAMETER;
+        if (!list || (list->NumOfParams && !list->ConfigPtr)) {
+            set_err("NULL configuration list or parameter array");
+            return ERR_NULL_PARAMETER;
+        }
         for (uint32_t i = 0; i < list->NumOfParams; i++)
             if (list->ConfigPtr[i].Parameter == LOOPBACK && list->ConfigPtr[i].Value > 1) {
                 set_err("LOOPBACK must be 0 or 1");
@@ -527,10 +533,12 @@ J2534_LONG J2534_API PassThruIoctl(J2534_ULONG ChannelID, J2534_ULONG IoctlID,
 
 J2534_LONG J2534_API PassThruStartPeriodicMsg(J2534_ULONG ChannelID, PASSTHRU_MSG *pMsg,
                                         J2534_ULONG *pMsgID, J2534_ULONG TimeInterval)
-{ (void)ChannelID;(void)pMsg;(void)pMsgID;(void)TimeInterval; return ERR_NOT_SUPPORTED; }
+{ (void)ChannelID;(void)pMsg;(void)pMsgID;(void)TimeInterval;
+  set_err("periodic transmission is not supported"); return ERR_NOT_SUPPORTED; }
 
 J2534_LONG J2534_API PassThruStopPeriodicMsg(J2534_ULONG ChannelID, J2534_ULONG MsgID)
-{ (void)ChannelID;(void)MsgID; return ERR_NOT_SUPPORTED; }
+{ (void)ChannelID;(void)MsgID;
+  set_err("periodic transmission is not supported"); return ERR_NOT_SUPPORTED; }
 
 J2534_LONG J2534_API PassThruSetProgrammingVoltage(J2534_ULONG DeviceID, J2534_ULONG PinNumber,
                                              J2534_ULONG Voltage)

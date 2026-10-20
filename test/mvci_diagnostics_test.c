@@ -69,6 +69,15 @@ int main(void)
           strcmp(error, "NULL version output") == 0,
           "other thread does not overwrite caller error");
 
+    J2534_ULONG channel = 0;
+    check(PassThruConnect(device, ISO9141, 0, 10400, &channel) == STATUS_NOERROR,
+          "connect scripted channel for IOCTL diagnostics");
+    check(PassThruIoctl(channel, GET_CONFIG, NULL, NULL) == ERR_NULL_PARAMETER &&
+          PassThruGetLastError(error) == STATUS_NOERROR && strstr(error, "configuration"),
+          "configuration failure replaces unrelated version error");
+    check(PassThruStopPeriodicMsg(channel, 1) == ERR_NOT_SUPPORTED &&
+          PassThruGetLastError(error) == STATUS_NOERROR && strstr(error, "periodic"),
+          "unsupported periodic call reports its own error");
     check(PassThruClose(device) == STATUS_NOERROR, "close scripted device");
     return failures ? 1 : 0;
 }
