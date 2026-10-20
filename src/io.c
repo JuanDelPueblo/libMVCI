@@ -150,10 +150,13 @@ void mvci_io_close(mvci_io_t *io)
 
 /* D2XX documents no value for a timeout of 0 (the D2XX Programmer's Guide, v1.5,
  * describes FT_SetTimeouts only as "in milliseconds"), so 0 is never passed.
- * FT_Write has no documented nonblocking mode and reports a write timeout only
- * as a short count (FT_OK, written < n). The count is host acceptance, not wire
- * transmission. A failed status is -1 even when bytes were accepted: the caller
- * must treat that write as ambiguous. This function never retries. */
+ * The guide's FT_Write section says only FT_OK or an error code. A short count
+ * on a write timeout is documented for FT_W32_WriteFile (FT_W32_SetCommTimeouts)
+ * and is INFERRED here for FT_Write: UNPROVEN until a real D2XX run shows it.
+ * Either way is safe: a short count is returned as the partial accepted count,
+ * and a failed status is -1 even when bytes were accepted, which the caller must
+ * treat as ambiguous. The count is host acceptance, not wire transmission.
+ * This function never retries. */
 int mvci_io_write_timeout(mvci_io_t *io, const uint8_t *buf, int n, int timeout_ms)
 {
     DWORD written = 0;

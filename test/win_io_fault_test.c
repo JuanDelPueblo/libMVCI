@@ -9,7 +9,9 @@
  * model of the documented D2XX contract (FTDI D2XX Programmer's Guide v1.5):
  * FT_Read returns at once when asked for no more than FT_GetQueueStatus
  * reports, otherwise it waits up to the read timeout and returns FT_OK with a
- * short count; FT_Write reports a write timeout as a short count. The guide
+ * short count. FT_Write is modeled to report a write timeout as a short count:
+ * the guide documents that only for FT_W32_WriteFile, so it is an inference
+ * for FT_Write, and the status-failure case is tested as well. The guide
  * gives no meaning for a timeout of 0, so the model hangs forever there: any
  * path that could reach it fails the test. This does NOT prove D2XX or Windows
  * behavior: the real driver stays UNPROVEN offline.
