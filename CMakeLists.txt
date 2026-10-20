@@ -121,6 +121,61 @@ set_target_properties(MVCI PROPERTIES
     SOVERSION ${PROJECT_VERSION_MAJOR})
 
 # --------------------------------------------------------------------------
+# Offline test helpers.
+#
+# Every test target compiles the driver sources directly; it never loads the
+# shared library. The no-argument run is the hardware-free check. A focused
+# regression test is one file named test/mvci_<area>_test.c and is registered
+# automatically below; the build command for a standalone file is:
+#
+#     cmake -S . -B build/tests -DMVCI_BUILD_TESTS=ON
+#     cmake --build build/tests
+#     ctest --test-dir build/tests
+#
+# By default a test links test/mock_io.c, the in-memory scripted Mini-VCI
+# device, and the provider sources (src/passthru.c, src/serial.c, src/des.c).
+# A test that supplies its own mvci_io_* stubs is listed in the
+# MVCI_OFFLINE_TESTS_NO_MOCK cache list (semicolon-separated names).
+# test/<name>_support.c is compiled with its test when that file exists.
+# --------------------------------------------------------------------------
+function(_mvci_link_test target)
+    if(WIN32)
+        target_link_libraries(${target} PRIVATE bcrypt)
+    elseif(APPLE)
+        target_link_libraries(${target} PRIVATE Threads::Threads)
+    else()
+        target_link_libraries(${target} PRIVATE OpenSSL::Crypto Threads::Threads)
+    endif()
+endfunction()
+
+function(mvci_add_offline_test name)
+    cmake_parse_arguments(_mvci_test "NO_MOCK" "" "" ${ARGN})
+
+    set(_mvci_sources
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/${name}.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/passthru.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/serial.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/des.c)
+
+    if(NOT _mvci_test_NO_MOCK)
+        list(APPEND _mvci_sources ${CMAKE_CURRENT_SOURCE_DIR}/test/mock_io.c)
+    endif()
+
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test/${name}_support.c)
+        list(APPEND _mvci_sources ${CMAKE_CURRENT_SOURCE_DIR}/test/${name}_support.c)
+    endif()
+
+    add_executable(${name} ${_mvci_sources})
+    target_include_directories(${name} PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    _mvci_link_test(${name})
+
+    # No arguments: a hardware-free run.
+    add_test(NAME ${name} COMMAND ${name})
+endfunction()
+
+# --------------------------------------------------------------------------
 # Self-test (links the protocol layer directly, not the J2534 exports)
 # --------------------------------------------------------------------------
 if(MVCI_BUILD_TESTS)
@@ -168,6 +223,26 @@ if(MVCI_BUILD_TESTS)
     endif()
 
     add_test(NAME mvci_seqtest COMMAND mvci_seq_test)
+
+    # Any other focused regression test in test/mvci_<area>_test.c is an
+    # offline test with the same defaults. Integration does not edit this file
+    # for a new test: add the standalone source and reconfigure. Put a test
+    # that brings its own transport stubs in MVCI_OFFLINE_TESTS_NO_MOCK.
+    set(MVCI_OFFLINE_TESTS_NO_MOCK "" CACHE STRING
+        "test/mvci_<area>_test.c names that supply their own transport stubs")
+    file(GLOB _mvci_extra_tests CONFIGURE_DEPENDS
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/mvci_*_test.c)
+    foreach(_mvci_test_source ${_mvci_extra_tests})
+        get_filename_component(_mvci_test_name ${_mvci_test_source} NAME_WE)
+        if(_mvci_test_name STREQUAL "mvci_seq_test")
+            continue()
+        endif()
+        if(_mvci_test_name IN_LIST MVCI_OFFLINE_TESTS_NO_MOCK)
+            mvci_add_offline_test(${_mvci_test_name} NO_MOCK)
+        else()
+            mvci_add_offline_test(${_mvci_test_name})
+        endif()
+    endforeach()
 endif()
 
 # --------------------------------------------------------------------------
