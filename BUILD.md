@@ -15,7 +15,8 @@ CMake is the single build system for every platform (Linux, macOS, Windows).
 include/mvci/   public headers      -> #include <mvci/j2534.h>, <mvci/serial.h>
 src/            sources + private headers (io.h, compat.h, mvci.def)
 test/           mvci_test.c (codec/live harness), mvci_seq_test.c (provider
-                sequence test), mock_io.c (scripted transport)
+                sequence test), mvci_lifecycle_test.c (public lifecycle
+                interleavings), mock_io.c (scripted transport)
 cmake/          libmvciConfig.cmake.in (package config template)
 CMakeLists.txt  cross-platform build
 CMakePresets.json  win32/win64 + default build presets
@@ -34,7 +35,7 @@ external crypto dependency there.
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
-ctest --test-dir build            # two hardware-free tests
+ctest --test-dir build            # offline regressions from test/offline-tests.txt
 ```
 
 Outputs land in `build/` (multi-config generators like Visual Studio put them in
@@ -142,9 +143,12 @@ A build or test failure is a failure, not a skip. Nothing is installed.
 
 The focused suites cover captured codec vectors, provider command sequences,
 init output refusals, thread-local diagnostics, filters and clear operations,
-read/write counts and deadlines, framing and overflow, and backend failures.
-Platform fakes test status handling without loading the proprietary runtime.
-Paced and deadline tests use a test clock on the supported host.
+read/write counts and deadlines, framing and overflow, backend failures, and
+public lifecycle interleavings such as guards, read cancellation, handle reuse
+and Connect admission. Platform fakes test status handling without loading the
+proprietary runtime. Paced and deadline tests use a test clock on the supported
+host. `test/offline-tests.txt` is the manifest; it lists the target set and its
+host limits, and the build and direct paths read it rather than a fixed count.
 
 CMake can also run the native checks. It reports tests that need unavailable
 host features, such as GNU linker wraps or host OpenSSL fakes:
@@ -188,6 +192,8 @@ for the exports; confirm the names in the `objdump` output.
 - Physical voltage, K-line waveforms, and measured timing.
 - Adapter compatibility beyond the fixed-width ABI and export names.
 - Windows or macOS runtime behavior of the crypto and transport backends.
+- Exclusive port ownership on POSIX, or reconnection of a physical cable. A
+  scripted close and reopen is not proof that the adapter reconnects.
 - J2534 host acceptance, ECU communication, and programming.
 
 ### Reporting results
@@ -242,9 +248,14 @@ opens the adapter by its USB description `"M-VCI"`. Live test:
 
 ## Notes
 
-- The library models one ISO14230 channel per opened device (the adapter's
+- The library models one ISO9141 or ISO14230 channel per opened device (the adapter's
   single K-line). `PassThruOpen` runs the handshake and sends no background
-  traffic; `PassThruClose` tears the session down. A keepalive helper exists
+  traffic; `PassThruClose` tears the session down. A second Connect on a
+  connected device returns `ERR_CHANNEL_IN_USE` without waiting. Device and
+  channel handles are unique and never reused. A lost or ambiguous result
+  requires Close/Open; see
+  [session lifecycle](docs/PROTOCOL.md#8-teardown-and-session-lifecycle).
+  A keepalive helper exists
   for explicit use, but the provider path never starts it (T254/T255 prove
   the adapter tolerates multi-second idle with zero keepalive traffic).
 - `PassThruReadMsgs` maps device TX echoes to `TX_MSG_TYPE` and sets

@@ -141,6 +141,14 @@ denotes a little‑endian field.
 | Disconnect | `02` | `01 00 02 00 00 00 00 00` | status `02 00 02` |
 
 Notes:
+- **Connect admission.** The host admits `ISO9141` (3) or `ISO14230` (4) only,
+  at exactly 10400 baud, with flags that contain no bit outside
+  `ISO9141_NO_CHECKSUM | ISO9141_K_LINE_ONLY` (`0x0200 | 0x1000` = `0x1200`).
+  Another known protocol id returns `ERR_NOT_SUPPORTED`, an undefined id
+  returns `ERR_INVALID_PROTOCOL_ID`, other flag bits return `ERR_INVALID_FLAGS`,
+  and another baud rate returns `ERR_INVALID_BAUDRATE`. A refused Connect sends
+  no frame. One device carries one channel: a second Connect on a connected
+  device returns `ERR_CHANNEL_IN_USE` without waiting.
 - **Filter `type`** values follow J2534: `1` = PASS, `2` = BLOCK, `3` = FLOW_CONTROL.
 - **Set config** sends one parameter per command; J2534 parameter ids and values
   pass through unchanged (`param`, `value`). The captured programming path uses
@@ -263,8 +271,14 @@ Queue-only writes (`Timeout=0`) return `ERR_NOT_SUPPORTED` and count zero.
 
 The wire has no sequence field and `0E` replies do not echo the subfunction.
 Preflight rejects buffered orphan ACKs before sending a new command. A missing
-result or ambiguous framing blocks later commands until Close/Open. A purge or
-quiet interval cannot establish recovery. Arbitrarily delayed duplicates from
+result, partial write, ambiguous framing or malformed reply poisons the session:
+later commands are refused until Close/Open. A purge, quiet interval, later
+clean ACK or a new Connect in the same session cannot establish recovery. A
+checked host RX purge runs before Connect; a poisoned context or a failed purge
+refuses the Connect, and neither sends a cable command. Never treat the session
+as safe after an unknown result. See
+[session lifecycle](#8-teardown-and-session-lifecycle).
+Arbitrarily delayed duplicates from
 already-completed commands remain indistinguishable if they arrive during a
 later command with the same reply opcode. No deterministic recovery or physical
 ACK latency bound is claimed.
@@ -316,11 +330,71 @@ zero keepalive commands on the wire and no adapter reset, so an autonomous
 calls. A caller that holds a device open and idle far beyond the evidenced
 windows may call `mvci_start_keepalive()` explicitly.
 
-## 8. Teardown
+## 8. Teardown and session lifecycle
 
-To close a session cleanly: send **Disconnect** (`01 00 02 …`), then close the
-serial port / `FT_Close`. The next open performs the link‑layer reset (§1),
-which re‑initialises the adapter MCU.
+### 8.1 Disconnect
+
+To disconnect cleanly, send **Disconnect** (`01 00 02 …`). The device answers in
+plaintext with the exact frame `07 00 02 00 02 00 07`. Only that exact reply is
+the session boundary: the provider retires the channel handle permanently,
+drops queued records, partial frames and overflow state, and resets channel
+filters and the LOOPBACK policy. Any other answer returns `ERR_FAILED`; the
+channel stays connected. Any attempted write without the exact reply, including
+a short write or transport error, leaves an unknown result and poisons the
+session (§8.3). A failed host RX purge sends nothing and blocks queued delivery
+until a checked purge succeeds. A later
+exact reply completes the teardown but does not clear the earlier unknown
+result.
+
+### 8.2 Close and Open
+
+`PassThruClose` marks the device closing, so later lookups fail at once, then
+waits for running calls to leave. It detaches the context, sends Disconnect when
+the channel is connected, and closes the serial port or `FT_Close`. Close does
+not require the Disconnect acknowledgement. The next Open performs the
+link‑layer reset (§1), which re‑initialises the adapter MCU.
+
+Device and channel handles are unique 32-bit values. They are never reused and
+never derived from a slot offset, so a stale handle from an earlier Open or
+Connect cannot name a new object. When the identifier space is exhausted, a new
+Open or Connect is refused instead of wrapping.
+
+### 8.3 Recovery after an unknown result
+
+A lost or ambiguous result poisons the session. This covers a timeout with an outstanding command,
+a partial write, a malformed or desynchronised reply, an unanswered Disconnect,
+and a read poll cancelled after it was sent. A purge, quiet interval, later
+clean ACK, or a new Connect in the same session cannot prove recovery. Only
+Close/Open recovers. Before Connect, the provider performs a checked host RX
+purge and refuses a poisoned context; a refusal sends no cable command.
+`CLEAR_RX_BUFFER` and a zero-timeout drain never clear the poison.
+
+### 8.4 Read cancellation and shared calls
+
+Reads run as shared calls. Connect, Disconnect and Close run exclusively. When a
+Disconnect or Close is waiting, a read gives way at its next host I/O slice of
+20 ms. The slice only lets the read check for cancellation: it does not shorten
+the caller deadline when nothing cancels, and it is not a cable poll interval or
+a K-line timing measurement. Records already delivered are returned with
+`STATUS_NOERROR`; otherwise the read reports `ERR_FAILED`. A poll cancelled
+before it sent anything leaves the session usable. A poll cancelled after its
+command was sent has an unknown result and poisons the session (§8.3).
+
+A channel-scoped shared call that meets a waiting Disconnect or Close fails at
+once with `ERR_INVALID_CHANNEL_ID`, without consuming its caller's budget.
+Device-scoped shared calls (version and voltage) wait for a running exclusive
+call. Writes, filters and IOCTLs are not cancelled; a waiting Close may wait for
+their own transport timeouts.
+
+### 8.5 Reconnection scope
+
+No preemptive re‑handshake is implemented. The handshake (§3) runs in Open only.
+Same-context reconnect after Disconnect is not established on hardware. A
+scripted close and reopen, or any fake transport reconnect, does not prove that a physical
+cable reconnects or that the adapter accepts a new session; that needs cable and
+vehicle evidence. The offline lifecycle tests do not establish Windows runtime
+behavior, and the POSIX transport takes no exclusive ownership of the serial
+node, so another process can open the same port.
 
 ## 9. Worked example
 

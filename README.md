@@ -52,6 +52,10 @@ firmware applies the requested behavior.
 - **J2534 API coverage is partial.** Synchronous write batches use one caller
   deadline and report the completed adapter ACK count. Queue-only writes,
   unsupported flags and mismatched message protocols are refused.
+- **Device and channel lifetime** — handles are unique and never reused, and
+  calls are guarded until `PassThruClose` frees the context. Reads give way to
+  a waiting Disconnect or Close. One device carries one channel. See
+  [session lifecycle](docs/PROTOCOL.md#8-teardown-and-session-lifecycle).
 - **Configuration read-back** — `GET_CONFIG` reports only the host‑enforced
   `LOOPBACK` delivery policy. Cable timing parameters return `ERR_NOT_SUPPORTED`,
   even after a successful `SET_CONFIG`. A cable ACK does not prove that its
@@ -88,10 +92,29 @@ physical timing, electrical behavior, or ECU acceptance.
   and retains failed entries. TX clear is unsupported. RX clear covers only
   host state and serial input, and reports a host purge failure. See
   [filter and clear contracts](docs/filter-and-clear-contracts.md).
+- **Session lifetime and recovery.** A waiting Disconnect or Close cancels a
+  read at its next host I/O slice. Messages already delivered are returned;
+  otherwise the read reports `ERR_FAILED`. A canceled poll that had already
+  been sent, a timeout with an outstanding command, a desync, or an incomplete
+  Disconnect write leaves an unknown
+  result: the session is poisoned and only Close/Open recovers. A purge, quiet
+  interval, later clean ACK, or same-session reconnect does not establish
+  recovery. Before Connect, the driver performs a host RX purge and refuses a
+  poisoned context without sending a cable command. Disconnect needs the exact
+  plaintext reply; only
+  then is the channel handle retired and the old queued and partial state
+  dropped. Connect admits only ISO9141 or ISO14230 at 10400 baud with flags
+  inside `0x1200`; other protocols, flags and baud rates are refused before a
+  byte reaches the cable. A second Connect on a connected device returns
+  `ERR_CHANNEL_IN_USE` without waiting.
 - **Platform validation.** Host-side fakes cover CNG, CommonCrypto and D2XX
   status handling. Cross-compilation checks Windows ABI and exports. These
   checks do not prove the real Windows or macOS runtimes, USB timing, or cable
-  electrical behavior.
+  electrical behavior. The POSIX transport does not take exclusive ownership of
+  the serial node, so another process can open the same adapter. A scripted
+  close and reopen, or a fake reconnection, does not prove that a physical cable
+  reconnects. A new Connect in the same open context does not run the handshake.
+  Same-context reconnect after Disconnect is not established on hardware.
 - **Unsupported capabilities are refused.** ISO15765/CAN, periodic transmission,
   battery-voltage reads, pattern-only init and positive programming voltage
   remain unsupported. The provider models one channel per open device.
@@ -177,7 +200,8 @@ PIDs).
 include/mvci/    public headers      ->  #include <mvci/j2534.h>, <mvci/serial.h>
 src/             sources + private headers (io.h, compat.h, mvci.def)
 test/            mvci_test.c codec/live harness, mvci_seq_test.c provider
-                 sequence test, mock_io.c scripted transport
+                 sequence test, mvci_lifecycle_test.c public lifecycle
+                 interleavings, mock_io.c scripted transport
 docs/            protocol specification (PROTOCOL.md)
 cmake/           package-config template (libmvciConfig.cmake.in)
 CMakeLists.txt   cross-platform build
