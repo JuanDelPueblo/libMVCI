@@ -336,6 +336,10 @@ static int read_frame_until(mvci_ctx_t *ctx, uint8_t *buf, int cap,
         max_empty = (r0 > 0 ? r0 / MVCI_READ_SLICE_MS : 0) + 2;
     }
     for (;;) {
+        /* A positive transport read can still leave most of a frame buffered.
+         * Stop between reads as well as after empty slices so Close/Disconnect
+         * does not wait for an arbitrarily slow byte stream. */
+        if (max_empty && cancel_requested(ctx)) return MVCI_PIPE_CANCELED;
         /* A nonblocking transport call can still take execution time. Keep
          * all bytes in rx_frame if it crosses the caller's deadline. */
         int remaining = timed ? (int32_t)(deadline - mvci_now_ms()) : 0;
@@ -499,7 +503,8 @@ static int lock_until(mvci_ctx_t *ctx, uint32_t deadline, int may_wait, int canc
  * Arbitrarily delayed duplicate ACKs after a completed command still require
  * physical/protocol evidence; this code does not claim to disambiguate them. */
 static int transact_until_locked(mvci_ctx_t *ctx, const uint8_t *inner, size_t inner_len,
-                                 uint8_t *resp_inner, size_t resp_cap, uint32_t deadline)
+                                 uint8_t *resp_inner, size_t resp_cap, uint32_t deadline,
+                                 int cancellable)
 {
     if (ctx->rx_purge_failed) return MVCI_PIPE_IO;
     if (ctx->poisoned) return MVCI_PIPE_DESYNC;
@@ -524,6 +529,11 @@ static int transact_until_locked(mvci_ctx_t *ctx, const uint8_t *inner, size_t i
         if ((int32_t)(deadline - mvci_now_ms()) <= 0) return MVCI_PIPE_TIMEOUT;
     }
     if (ctx->rx_used) { ctx->poisoned = 1; return MVCI_PIPE_DESYNC; }
+    /* This check is the cancellation/send boundary. Do not hold cancel_lock
+     * across transport I/O: Close/Disconnect must be able to mark the read
+     * canceled while a transport call is in progress. A cancellation ordered
+     * after this boundary may race the write and is treated as post-send. */
+    if (cancellable && cancel_requested(ctx)) return MVCI_PIPE_CANCELED;
     int remaining = (int32_t)(deadline - mvci_now_ms());
     if (remaining <= 0) return MVCI_PIPE_TIMEOUT;
     dbg_hex("TX inner:", inner, (int)inner_len);
@@ -566,7 +576,7 @@ static int transact_locked(mvci_ctx_t *ctx, const uint8_t *inner, size_t inner_l
 {
     if (timeout_ms <= 0) return MVCI_PIPE_TIMEOUT;
     return transact_until_locked(ctx, inner, inner_len, resp_inner, resp_cap,
-                                  mvci_now_ms() + (uint32_t)timeout_ms);
+                                 mvci_now_ms() + (uint32_t)timeout_ms, 0);
 }
 
 int mvci_transact(mvci_ctx_t *ctx, const uint8_t *inner, size_t inner_len,
@@ -816,7 +826,8 @@ int mvci_poll_until(mvci_ctx_t *ctx, uint8_t *msg_out, size_t cap,
         r = drain_record(ctx, resp, deadline, timed, work_left);
         if (!r && timed && *work_left && !ctx->rx_used) {
             int n = mvci_inner_read_poll(ctx->proto, in);
-            r = transact_until_locked(ctx, in, n, resp, sizeof resp, deadline);
+            r = cancel_requested(ctx) ? MVCI_PIPE_CANCELED :
+                transact_until_locked(ctx, in, n, resp, sizeof resp, deadline, 1);
             if (r > 0) --*work_left;
         } else if (!r && timed && *work_left && ctx->rx_used) {
             r = receive_inner_until(ctx, resp, deadline, 1, 1);

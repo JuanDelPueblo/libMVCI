@@ -2,9 +2,9 @@
  *
  * Build ( this file supplies its own mvci_io_* transport, virtual
  * clock and thread-safe device model; do not link test/mock_io.c or io.c, and
- * pass no --wrap flags):
+ * wrap mvci_set_read_cancel to observe the real teardown signal):
  *   cc -std=gnu11 -DMVCI_TESTING -Iinclude -Isrc test/mvci_lifecycle_test.c src/passthru.c \
- *      src/serial.c src/des.c -lcrypto -lpthread
+ *      src/serial.c src/des.c -Wl,--wrap=mvci_set_read_cancel -lcrypto -lpthread
  *
  * Interleavings are forced with events, not with sleeps. A thread parks inside
  * the scripted transport (a write waiting for its ACK, or an empty read) and
@@ -114,6 +114,9 @@ static struct {
     int park_op, park_left, parked, release_park;
     int mute_op, reject_op;
     int gate_reads, reads_parked, slice_tokens;
+    int gate_nonblocking, nonblocking_parked, release_nonblocking;
+    int drip_positive, positive_reads, gate_positive, positive_parked, release_positive;
+    int cancel_seen;
     int purge_fail;
     int go;                       /* start barrier */
     uint32_t msgids[64]; int nmsgids;
@@ -124,7 +127,20 @@ static void T_unlock(void) { mvci_mutex_unlock(&TM); }
 #define T_WAIT(expr) while (!(expr)) mvci_cond_wait(&TC, &TM)
 static void T_signal(void) { mvci_cond_broadcast(&TC); }
 
+/* Observe the production cancellation signal from a real public Disconnect.
+ * This wrapper never changes it or calls a test-only cancellation setter. */
+void __real_mvci_set_read_cancel(mvci_ctx_t *, int);
+void __wrap_mvci_set_read_cancel(mvci_ctx_t *ctx, int on)
+{
+    __real_mvci_set_read_cancel(ctx, on);
+    T_lock();
+    if (on) X.cancel_seen = 1;
+    T_signal();
+    T_unlock();
+}
+
 static int sleep_events;                       /* guarded by TM */
+
 static void sleep_event(void)
 {
     T_lock();
@@ -288,6 +304,14 @@ int mvci_io_read(mvci_io_t *io, uint8_t *buf, int n, int timeout_ms)
     T_lock();
     io->inside++;
     int avail = io->qt - io->qh;
+    if (!timeout_ms && avail <= 0 && X.gate_nonblocking) {
+        X.gate_nonblocking = 0;
+        X.nonblocking_parked = 1;
+        T_signal();
+        T_WAIT(X.release_nonblocking);
+        X.nonblocking_parked = 0;
+        avail = io->qt - io->qh;
+    }
     if (avail <= 0 && timeout_ms > 0 && X.gate_reads) {
         /* Park as a blocked transport read until the test grants a slice. */
         X.reads_parked++;
@@ -302,6 +326,16 @@ int mvci_io_read(mvci_io_t *io, uint8_t *buf, int n, int timeout_ms)
         avail = io->qt - io->qh;
     }
     if (avail > 0) {
+        if (X.drip_positive && timeout_ms > 0 && timeout_ms <= 20) {
+            if (X.positive_reads == 1 && X.gate_positive) {
+                X.positive_parked = 1;
+                T_signal();
+                T_WAIT(X.release_positive);
+                X.positive_parked = 0;
+            }
+            X.positive_reads++;
+            if (n > 1) n = 1;
+        }
         if (n > avail) n = avail;
         memcpy(buf, io->rxq + io->qh, (size_t)n);
         io->qh += n;
@@ -624,6 +658,60 @@ static void test_close_cancels_read(void)
     PASSTHRU_MSG m;
     CHECK(PassThruReadMsgs(ch, &m, &n, 10) == ERR_INVALID_CHANNEL_ID && n == 0, "stale channel is invalid");
     puts("done: close cancels a parked read");
+}
+
+/* Cancellation during a nonblocking preflight drain must stop before the
+ * poll command crosses the send boundary. The session remains reconnectable. */
+static void test_cancel_during_preflight_sends_no_poll(void)
+{
+    x_reset();
+    J2534_ULONG d = open_dev(), ch = connect_dev(d);
+    T_lock(); X.mute_op = 9; X.gate_nonblocking = 1; X.cancel_seen = 0; T_unlock();
+    job_t r, dis;
+    job_startx(&r, J_READ, ch, 1, 10000);
+    release_start();
+    T_lock(); T_WAIT(X.nonblocking_parked); T_unlock();
+    job_start(&dis, J_DISCONNECT, ch);
+    T_lock(); T_WAIT(X.cancel_seen); X.release_nonblocking = 1; T_signal(); T_unlock();
+    job_join(&r); job_join(&dis);
+    CHECK(r.rc == ERR_FAILED && r.n == 0, "preflight cancellation interrupts the public read");
+    CHECK(frames_op(9) == 0, "cancellation before the send boundary emits no read poll");
+    CHECK(dis.rc == 0, "Disconnect after a pre-send cancellation");
+    T_lock(); X.mute_op = -1; T_unlock();
+    J2534_ULONG ch2 = 0;
+    CHECK(PassThruConnect(d, ISO9141, 0x1200, 10400, &ch2) == 0 && ch2 && ch2 != ch,
+          "cancel before sending does not poison reconnect");
+    close_dev(d);
+    puts("done: preflight cancel sends no poll");
+}
+
+/* A positive byte is not a reason to ignore cancellation. Stop at the next
+ * byte boundary, preserve the fact that the sent poll has an unknown result. */
+static void test_cancel_between_positive_reads(void)
+{
+    x_reset();
+    J2534_ULONG d = open_dev(), ch = connect_dev(d);
+    const uint8_t data[6] = { 0x48, 0x6b, 0x10, 0x41, 0x0c, 0x55 };
+    dev_push_poll_record(live_dev(), data, sizeof data);
+    T_lock(); X.drip_positive = 1; X.gate_positive = 1; X.cancel_seen = 0; T_unlock();
+    job_t r, dis;
+    job_startx(&r, J_READ, ch, 1, 10000);
+    release_start();
+    T_lock(); T_WAIT(X.positive_parked); T_unlock();
+    job_start(&dis, J_DISCONNECT, ch);
+    T_lock(); T_WAIT(X.cancel_seen); X.release_positive = 1; T_signal(); T_unlock();
+    job_join(&r); job_join(&dis);
+    T_lock(); int positive_reads = X.positive_reads; X.drip_positive = 0; T_unlock();
+    CHECK(r.rc == ERR_FAILED && r.n == 0, "post-send cancellation interrupts the public read");
+    CHECK(positive_reads == 2, "canceled read stops after the in-flight byte and before another transport read");
+    CHECK(dis.rc == 0, "Disconnect after a post-send cancellation");
+    int connects = frames_op(0x07);
+    J2534_ULONG ch2 = 0;
+    CHECK(PassThruConnect(d, ISO9141, 0x1200, 10400, &ch2) != 0 && ch2 == 0,
+          "cancel after sending preserves the poisoned session");
+    CHECK(frames_op(0x07) == connects, "poisoned reconnect sends no Connect command");
+    close_dev(d);
+    puts("done: positive-read cancellation poisons sent poll");
 }
 
 /* Cancel after the read poll was sent: its result is unknown, so the context
@@ -1116,6 +1204,8 @@ int main(void)
     test_disconnect_waits_for_active_write();
     test_close_during_connect();
     test_close_cancels_read();
+    test_cancel_during_preflight_sends_no_poll();
+    test_cancel_between_positive_reads();
     test_disconnect_after_ambiguous_cancel();
     test_disconnect_clears_partial_frame();
     test_stale_queued_frame();
