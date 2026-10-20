@@ -246,8 +246,10 @@ opens the adapter by its USB description `"M-VCI"`. Live test:
   traffic; `PassThruClose` tears the session down. A keepalive helper exists
   for explicit use, but the provider path never starts it (T254/T255 prove
   the adapter tolerates multi-second idle with zero keepalive traffic).
-- `PassThruReadMsgs` returns the device RxStatus byte unchanged (`0` = received
-  data, `2` = TX echo), matching the original DLL's behaviour.
+- `PassThruReadMsgs` maps device TX echoes to `TX_MSG_TYPE` and sets
+  `ExtraDataIndex=DataSize` for complete records. It preserves the observed
+  one-byte `48`/status `02` receive indication with `ExtraDataIndex=0`.
+  Adapter timestamps remain unknown; `Timestamp` stays zero.
 - Wired IOCTLs include truthful `GET_CONFIG(LOOPBACK)`, `SET_CONFIG`,
   `FIVE_BAUD_INIT`, `FAST_INIT`, `CLEAR_PERIODIC_MSGS`, `CLEAR_RX_BUFFER`,
   and `CLEAR_MSG_FILTERS`. Only a connected channel can use channel IOCTLs.

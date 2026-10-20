@@ -340,8 +340,12 @@ J2534_LONG J2534_API PassThruReadMsgs(J2534_ULONG ChannelID, PASSTHRU_MSG *pMsg,
             PASSTHRU_MSG *o = &pMsg[*pNumMsgs];
             memset(o, 0, sizeof *o);
             o->ProtocolID = s->proto;
-            o->RxStatus = rx;
+            int prefix = rx == 2 && m == 1 && buf[0] == 0x48;
+            o->RxStatus = rx == 2 && !prefix ? TX_MSG_TYPE : rx;
             o->DataSize = (uint32_t)m;
+            /* Complete records have no extra bytes. Preserve the observed
+             * one-byte receive indication separately from real TX echoes. */
+            o->ExtraDataIndex = prefix ? 0 : (uint32_t)m;
             memcpy(o->Data, buf, (size_t)m);
             ++*pNumMsgs;
             continue;

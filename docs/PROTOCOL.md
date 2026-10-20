@@ -226,12 +226,15 @@ a nonempty list is refused. The call sends no cable command.
 
 Only `LOOPBACK` is reportable. It is a host delivery policy, not a cable
 setting: `0` suppresses device transmit echoes; `1` forwards real device echoes
-unchanged. The driver never creates an echo from a requested write, and the
-policy does not prove that the cable firmware generates echoes. A new channel
+with standard `TX_MSG_TYPE` metadata. The driver never creates an echo from a
+requested write, and the policy does not prove that the cable firmware generates
+echoes. A new channel
 starts at `1`, which preserves the original provider behavior.
 `SET_CONFIG(LOOPBACK)` accepts only `0` and `1` and sends no cable command. The
 one-byte `48` receive prefix with status `02` is preserved in either mode; it is
-not a transmit echo.
+not a transmit echo. Its `ExtraDataIndex` is zero. Complete data and echo records
+have `ExtraDataIndex=DataSize`. Their payload bytes remain unchanged and their
+unmeasured adapter `Timestamp` is zero.
 
 No cable read-configuration command is evidenced. `GET_CONFIG` therefore
 returns `ERR_NOT_SUPPORTED` for every other parameter, including `DATA_RATE`,
