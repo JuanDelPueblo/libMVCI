@@ -148,6 +148,32 @@ void mvci_io_close(mvci_io_t *io)
     free(io);
 }
 
+/* Timeout setup itself uses caller time. Admit blocking I/O only after its
+ * installed timeout fits the remaining absolute budget. If setup took time,
+ * use its observed cost to choose a shorter next timeout, then check again.
+ * The observation is an estimate, never a latency guarantee: expiration
+ * refuses I/O before bytes are offered. No serial write is retried. */
+static int ft_set_timeout_until(mvci_io_t *io, uint32_t deadline, int reading)
+{
+    int budget = (int32_t)(deadline - mvci_now_ms());
+    while (budget > 0) {
+        uint32_t before = mvci_now_ms();
+        ULONG rd = reading ? (ULONG)budget : io->rd_ms;
+        ULONG wr = reading ? io->wr_ms : (ULONG)budget;
+        if (FT.SetTimeouts(io->h, rd, wr) != FT_OK) return -1;
+        io->rd_ms = rd;
+        io->wr_ms = wr;
+        uint32_t after = mvci_now_ms();
+        int remaining = (int32_t)(deadline - after);
+        if (remaining <= 0) return 0;
+        if (budget <= remaining) return 1;
+        int spent = (int32_t)(after - before);
+        budget = remaining - spent;
+        if (budget <= 0) budget = 1;
+    }
+    return 0;
+}
+
 /* D2XX documents no value for a timeout of 0 (the D2XX Programmer's Guide, v1.5,
  * describes FT_SetTimeouts only as "in milliseconds"), so 0 is never passed.
  * The guide's FT_Write section says only FT_OK or an error code. A short count
@@ -164,8 +190,9 @@ int mvci_io_write_timeout(mvci_io_t *io, const uint8_t *buf, int n, int timeout_
     if (n == 0) return 0;
     /* No documented way to offer bytes without a wait: accept none. */
     if (timeout_ms == 0) return 0;
-    if (FT.SetTimeouts(io->h, io->rd_ms, (ULONG)timeout_ms) != FT_OK) return -1;
-    io->wr_ms = (ULONG)timeout_ms;
+    uint32_t deadline = mvci_now_ms() + (uint32_t)timeout_ms;
+    int configured = ft_set_timeout_until(io, deadline, 0);
+    if (configured <= 0) return configured;
     if (FT.Write(io->h, (LPVOID)buf, (DWORD)n, &written) != FT_OK) return -1;
     return written <= (DWORD)n ? (int)written : -1;
 }
@@ -192,8 +219,9 @@ int mvci_io_read(mvci_io_t *io, uint8_t *buf, int n, int timeout_ms)
         if (FT.Read(io->h, buf, queued, &got) != FT_OK) return -1;
         return got <= queued ? (int)got : -1;
     }
-    if (FT.SetTimeouts(io->h, (ULONG)timeout_ms, io->wr_ms) != FT_OK) return -1;
-    io->rd_ms = (ULONG)timeout_ms;
+    uint32_t deadline = mvci_now_ms() + (uint32_t)timeout_ms;
+    int configured = ft_set_timeout_until(io, deadline, 1);
+    if (configured <= 0) return configured;
     if (FT.Read(io->h, buf, (DWORD)n, &got) != FT_OK) return -1;
     return got <= (DWORD)n ? (int)got : -1;     /* got < n is a timeout */
 }

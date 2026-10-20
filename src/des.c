@@ -59,24 +59,27 @@ static BCRYPT_ALG_HANDLE g_alg = NULL;
 
 static BCRYPT_ALG_HANDLE des_alg(void)
 {
-    if (!g_alg) {
-        BCRYPT_ALG_HANDLE a = NULL;
-        if (!NT_SUCCESS(BCryptOpenAlgorithmProvider(&a, BCRYPT_DES_ALGORITHM, NULL, 0)))
-            return NULL;
-        /* Without ECB, CNG keeps its default chaining mode and silently
-         * produces different ciphertext after block 0. Never publish such a
-         * provider. */
-        if (!NT_SUCCESS(BCryptSetProperty(a, BCRYPT_CHAINING_MODE,
-                          (PUCHAR)BCRYPT_CHAIN_MODE_ECB,
-                          (ULONG)((wcslen(BCRYPT_CHAIN_MODE_ECB) + 1) * sizeof(WCHAR)), 0))) {
-            BCryptCloseAlgorithmProvider(a, 0);
-            return NULL;
-        }
-        /* benign race: if two threads set it, both store the same handle */
-        if (InterlockedCompareExchangePointer((PVOID *)&g_alg, a, NULL) != NULL)
-            BCryptCloseAlgorithmProvider(a, 0);
+    /* Reads and publication use the same interlocked synchronization. The
+     * per-context I/O lock does not protect this process-wide cache. */
+    BCRYPT_ALG_HANDLE winner = (BCRYPT_ALG_HANDLE)
+        InterlockedCompareExchangePointer((PVOID volatile *)&g_alg, NULL, NULL);
+    if (winner) return winner;
+    BCRYPT_ALG_HANDLE a = NULL;
+    if (!NT_SUCCESS(BCryptOpenAlgorithmProvider(&a, BCRYPT_DES_ALGORITHM, NULL, 0)))
+        return NULL;
+    if (!NT_SUCCESS(BCryptSetProperty(a, BCRYPT_CHAINING_MODE,
+                      (PUCHAR)BCRYPT_CHAIN_MODE_ECB,
+                      (ULONG)((wcslen(BCRYPT_CHAIN_MODE_ECB) + 1) * sizeof(WCHAR)), 0))) {
+        BCryptCloseAlgorithmProvider(a, 0);
+        return NULL;
     }
-    return g_alg;
+    winner = (BCRYPT_ALG_HANDLE)
+        InterlockedCompareExchangePointer((PVOID volatile *)&g_alg, a, NULL);
+    if (winner) {
+        BCryptCloseAlgorithmProvider(a, 0);
+        return winner;
+    }
+    return a;
 }
 
 #define DES_MAX_BLOCKS (0xFFFFFFFFu / 8)               /* CNG lengths are ULONG */

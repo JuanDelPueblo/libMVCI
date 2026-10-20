@@ -50,6 +50,7 @@ static int  g_dll_present, g_missing_symbol, g_freelib;
 static ULONG g_rd_tmo = 100, g_wr_tmo = 1000;   /* as last set through SetTimeouts */
 static int  g_write_short, g_write_over, g_write_fail_partial, g_read_avail, g_hang;
 static DWORD g_last_read_req, g_last_write_req;
+static ULONG g_setup_ms;
 
 #define FT_IO_ERROR 4
 static FT_STATUS step(int id)
@@ -71,6 +72,7 @@ static FT_STATUS WINAPI f_purge(FT_HANDLE h, ULONG m) { (void)h; return m == FT_
 static FT_STATUS WINAPI f_tmo(FT_HANDLE h, ULONG r, ULONG w)
 {
     (void)h; FT_STATUS s = step(C_TMO);
+    g_now += g_setup_ms;
     if (s == FT_OK) { g_rd_tmo = r; g_wr_tmo = w; }
     return s;
 }
@@ -120,6 +122,7 @@ FARPROC GetProcAddress(HMODULE m, LPCSTR n)
 
 static void fresh(void)
 {
+    g_setup_ms = 0;
     g_nlog = g_issued = g_nsleeps = 0; g_fail_index = -1; g_write_short = g_write_over = 0;
     g_write_fail_partial = 0; g_read_avail = 0; g_hang = 0; g_now = 0;
     g_dll_present = 1; g_missing_symbol = 0; g_freelib = 0;
@@ -212,6 +215,21 @@ int main(void)
     fresh();
     CHECK(mvci_io_write_timeout(io, msg, 3, 0x7fffffff) == 3 && g_wr_tmo == 0x7fffffffu,
           "largest int timeout is passed unchanged");
+
+    /* Timeout setup must not offer bytes after the caller budget expires. */
+    fresh(); g_setup_ms = 7;
+    CHECK(mvci_io_write_timeout(io, msg, 3, 5) == 0 && g_now == 7 && count(C_WRITE) == 0,
+          "expired setup refuses a write before offering any bytes");
+    fresh(); g_setup_ms = 2; g_write_short = 1;
+    CHECK(mvci_io_write_timeout(io, msg, 3, 10) == 2 && g_now == 10 &&
+          count(C_TMO) == 2 && count(C_WRITE) == 1,
+          "setup and one partial write share the original deadline");
+    fresh(); g_setup_ms = 7;
+    CHECK(mvci_io_read(io, buf, 3, 5) == 0 && g_now == 7 && count(C_READ) == 0,
+          "expired setup refuses a blocking read");
+    fresh(); g_setup_ms = 2;
+    CHECK(mvci_io_read(io, buf, 3, 10) == 0 && g_now == 10 && count(C_TMO) == 2 && count(C_READ) == 1,
+          "setup and one timed read share the original deadline");
 
     /* reads */
     fresh(); g_read_avail = 16;
