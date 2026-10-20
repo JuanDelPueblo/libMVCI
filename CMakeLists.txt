@@ -123,20 +123,15 @@ set_target_properties(MVCI PROPERTIES
 # --------------------------------------------------------------------------
 # Offline test helpers.
 #
-# Every test target compiles the driver sources directly; it never loads the
-# shared library. The no-argument run is the hardware-free check. A focused
-# regression test is one file named test/mvci_<area>_test.c and is registered
-# automatically below; the build command for a standalone file is:
+# Every test target compiles the sources it exercises directly; it never loads
+# the shared library and never touches hardware. test/offline-tests.txt is the
+# single list of supported regressions with its exact sources, definitions,
+# include directories and linker wraps. tools/check-offline.sh reads the same
+# file, so the CMake, direct-compiler and sanitizer paths cannot drift.
 #
-#     cmake -S . -B build/tests -DMVCI_BUILD_TESTS=ON
-#     cmake --build build/tests
-#     ctest --test-dir build/tests
-#
-# By default a test links test/mock_io.c, the in-memory scripted Mini-VCI
-# device, and the provider sources (src/passthru.c, src/serial.c, src/des.c).
-# A test that supplies its own mvci_io_* stubs is listed in the
-# MVCI_OFFLINE_TESTS_NO_MOCK cache list (semicolon-separated names).
-# test/<name>_support.c is compiled with its test when that file exists.
+# Add a regression by adding its source and one manifest line. There is no
+# directory glob: a line that names a missing source is a configure error, not
+# a silently reduced test set. The no-argument run is the hardware-free check.
 # --------------------------------------------------------------------------
 function(_mvci_link_test target)
     if(WIN32)
@@ -148,100 +143,100 @@ function(_mvci_link_test target)
     endif()
 endfunction()
 
-function(mvci_add_offline_test name)
-    cmake_parse_arguments(_mvci_test "NO_MOCK" "" "" ${ARGN})
-
-    set(_mvci_sources
-        ${CMAKE_CURRENT_SOURCE_DIR}/test/${name}.c
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/passthru.c
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/serial.c
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/des.c)
-
-    if(NOT _mvci_test_NO_MOCK)
-        list(APPEND _mvci_sources ${CMAKE_CURRENT_SOURCE_DIR}/test/mock_io.c)
-    endif()
-
-    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test/${name}_support.c)
-        list(APPEND _mvci_sources ${CMAKE_CURRENT_SOURCE_DIR}/test/${name}_support.c)
-    endif()
-
-    add_executable(${name} ${_mvci_sources})
-    target_include_directories(${name} PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    _mvci_link_test(${name})
-
-    # No arguments: a hardware-free run.
-    add_test(NAME ${name} COMMAND ${name})
-endfunction()
-
-# --------------------------------------------------------------------------
-# Self-test (links the protocol layer directly, not the J2534 exports)
-# --------------------------------------------------------------------------
 if(MVCI_BUILD_TESTS)
     enable_testing()
-    add_executable(mvci_test
-        test/mvci_test.c
-        src/serial.c
-        src/io.c
-        src/des.c)
-    target_include_directories(mvci_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
-    if(WIN32)
-        target_link_libraries(mvci_test PRIVATE bcrypt)
-    elseif(APPLE)
-        target_link_libraries(mvci_test PRIVATE Threads::Threads)
-    else()
-        target_link_libraries(mvci_test PRIVATE OpenSSL::Crypto Threads::Threads)
+    set(_mvci_manifest "${CMAKE_CURRENT_SOURCE_DIR}/test/offline-tests.txt")
+    if(NOT EXISTS "${_mvci_manifest}")
+        message(FATAL_ERROR "Missing offline test manifest: ${_mvci_manifest}")
     endif()
 
-    # No-argument run is the hardware-free codec self-test.
-    add_test(NAME mvci_selftest COMMAND mvci_test)
-
-    # J2534 provider sequence-equivalence test: the real PassThru* provider
-    # against an in-memory scripted device (test/mock_io.c). Asserts the
-    # exact emitted adapter-command sequences, so any extra background
-    # traffic fails the comparison. No hardware.
-    add_executable(mvci_seq_test
-        test/mvci_seq_test.c
-        test/mock_io.c
-        src/passthru.c
-        src/serial.c
-        src/des.c)
-    target_include_directories(mvci_seq_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/src)
-
     if(WIN32)
-        target_link_libraries(mvci_seq_test PRIVATE bcrypt)
+        set(_mvci_host win)
     elseif(APPLE)
-        target_link_libraries(mvci_seq_test PRIVATE Threads::Threads)
+        set(_mvci_host mac)
     else()
-        target_link_libraries(mvci_seq_test PRIVATE OpenSSL::Crypto Threads::Threads)
+        set(_mvci_host gnu)
     endif()
 
-    add_test(NAME mvci_seqtest COMMAND mvci_seq_test)
-
-    # Any other focused regression test in test/mvci_<area>_test.c is an
-    # offline test with the same defaults. Integration does not edit this file
-    # for a new test: add the standalone source and reconfigure. Put a test
-    # that brings its own transport stubs in MVCI_OFFLINE_TESTS_NO_MOCK.
-    set(MVCI_OFFLINE_TESTS_NO_MOCK "" CACHE STRING
-        "test/mvci_<area>_test.c names that supply their own transport stubs")
-    file(GLOB _mvci_extra_tests CONFIGURE_DEPENDS
-        ${CMAKE_CURRENT_SOURCE_DIR}/test/mvci_*_test.c)
-    foreach(_mvci_test_source ${_mvci_extra_tests})
-        get_filename_component(_mvci_test_name ${_mvci_test_source} NAME_WE)
-        if(_mvci_test_name STREQUAL "mvci_seq_test")
+    file(STRINGS "${_mvci_manifest}" _mvci_test_lines)
+    foreach(_mvci_line IN LISTS _mvci_test_lines)
+        string(STRIP "${_mvci_line}" _mvci_line)
+        if(_mvci_line STREQUAL "" OR _mvci_line MATCHES "^#")
             continue()
         endif()
-        if(_mvci_test_name IN_LIST MVCI_OFFLINE_TESTS_NO_MOCK)
-            mvci_add_offline_test(${_mvci_test_name} NO_MOCK)
-        else()
-            mvci_add_offline_test(${_mvci_test_name})
+
+        string(REPLACE "|" ";" _mvci_fields "${_mvci_line}")
+        list(LENGTH _mvci_fields _mvci_field_count)
+        if(NOT _mvci_field_count EQUAL 8)
+            message(FATAL_ERROR
+                "test/offline-tests.txt: expected 8 '|'-separated fields: ${_mvci_line}")
         endif()
+        list(GET _mvci_fields 0 _mvci_name)
+        list(GET _mvci_fields 1 _mvci_test_name)
+        list(GET _mvci_fields 2 _mvci_sources)
+        list(GET _mvci_fields 3 _mvci_defines)
+        list(GET _mvci_fields 4 _mvci_includes)
+        list(GET _mvci_fields 5 _mvci_wraps)
+        list(GET _mvci_fields 6 _mvci_hosts)
+        list(GET _mvci_fields 7 _mvci_note)
+        # CMake lists are ';'-separated; the manifest uses spaces.
+        foreach(_mvci_var _mvci_sources _mvci_defines _mvci_includes _mvci_wraps)
+            string(REPLACE " " ";" ${_mvci_var} "${${_mvci_var}}")
+        endforeach()
+        foreach(_mvci_var _mvci_defines _mvci_includes _mvci_wraps)
+            if("${${_mvci_var}}" STREQUAL "-")
+                set(${_mvci_var} "")
+            endif()
+        endforeach()
+
+        set(_mvci_supported TRUE)
+        if(_mvci_hosts STREQUAL "posix")
+            if(_mvci_host STREQUAL "win")
+                set(_mvci_supported FALSE)
+            endif()
+        elseif(_mvci_hosts STREQUAL "gnu")
+            if(NOT _mvci_host STREQUAL "gnu")
+                set(_mvci_supported FALSE)
+            endif()
+        elseif(NOT _mvci_hosts STREQUAL "any")
+            message(FATAL_ERROR
+                "test/offline-tests.txt: unknown host class '${_mvci_hosts}' for ${_mvci_name}")
+        endif()
+        if(NOT _mvci_supported)
+            message(STATUS
+                "MVCI: skipping offline test ${_mvci_name} on ${_mvci_host}: ${_mvci_note}")
+            continue()
+        endif()
+
+        set(_mvci_target_sources "")
+        foreach(_mvci_source IN LISTS _mvci_sources)
+            set(_mvci_source_path "${CMAKE_CURRENT_SOURCE_DIR}/${_mvci_source}")
+            if(NOT EXISTS "${_mvci_source_path}")
+                message(FATAL_ERROR
+                    "test/offline-tests.txt: ${_mvci_name} names missing source ${_mvci_source}")
+            endif()
+            list(APPEND _mvci_target_sources "${_mvci_source_path}")
+        endforeach()
+
+        add_executable(${_mvci_name} ${_mvci_target_sources})
+        target_include_directories(${_mvci_name} PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        foreach(_mvci_include IN LISTS _mvci_includes)
+            target_include_directories(${_mvci_name} PRIVATE
+                ${CMAKE_CURRENT_SOURCE_DIR}/${_mvci_include})
+        endforeach()
+        if(_mvci_defines)
+            target_compile_definitions(${_mvci_name} PRIVATE ${_mvci_defines})
+        endif()
+        foreach(_mvci_wrap IN LISTS _mvci_wraps)
+            target_link_options(${_mvci_name} PRIVATE "-Wl,--wrap=${_mvci_wrap}")
+        endforeach()
+        _mvci_link_test(${_mvci_name})
+
+        # No arguments: a hardware-free run.
+        add_test(NAME ${_mvci_test_name} COMMAND ${_mvci_name})
     endforeach()
 endif()
 

@@ -3,21 +3,21 @@
 #
 # Runs only offline work. It never opens a serial port, loads a provider,
 # contacts an adapter or a vehicle, installs a package, or uses the network.
-# Every artifact goes to one isolated output directory.
+# Every artifact goes to one isolated output directory that this script owns.
 #
 # Steps:
-#   1. Native build. Uses CMake when it is available; otherwise compiles the
-#      same source set directly with the native C compiler.
-#   2. Native tests with no arguments: the codec self-test, the provider
-#      sequence test, and any standalone test/mvci_*_test.c test.
+#   1. Native build. Uses CMake when it is available (and applies --cc to its
+#      first configure); otherwise compiles the same sources directly.
+#   2. Native tests with no arguments, from test/offline-tests.txt.
 #   3. Fixed-width J2534 ABI assertions and the native export set.
-#   4. Optional MinGW x86/x64 DLL build and undecorated-export check.
-#   5. Optional ASAN/UBSAN build and run.
+#   4. Optional MinGW DLL builds and undecorated-export checks.
+#   5. Optional ASAN/UBSAN builds and runs of the same manifest tests.
 #
-# A missing prerequisite is reported as SKIP with the reason. A compile or
-# test that starts and fails is reported as FAIL and exits non-zero; it is
-# never converted into a skip. The undocumented live-test argument is never
-# passed.
+# The test manifest is shared with CMakeLists.txt, so the CMake, direct and
+# sanitizer paths cannot drift. A host-specific test is reported as SKIP with
+# the missing capability. A compile or test that starts and fails is FAIL and
+# exits non-zero; it is never converted into a skip. The undocumented live-test
+# argument is never passed.
 #
 # Usage:
 #   tools/check-offline.sh [options]
@@ -31,14 +31,8 @@
 #   --no-sanitize   Skip the optional sanitizer build
 #   -h, --help      Show this text
 #
-# Environment:
-#   MVCI_OFFLINE_TESTS_NO_MOCK
-#       Space- or semicolon-separated test names whose test source supplies
-#       its own mvci_io_* stubs instead of linking test/mock_io.c. Keep this
-#       equal to the CMake list of the same name when both paths are used.
-#
-# Exit status: 0 when every executed check passed and at least one skip or
-# pass exists. 1 when any check failed. 2 for a usage or compiler error.
+# Exit status: 0 when every executed check passed and at least one check ran.
+# 1 when any check failed. 2 for a usage or setup error.
 
 set -uo pipefail
 
@@ -56,43 +50,96 @@ usage() {
          NR > 1 { exit }' "${BASH_SOURCE[0]}"
 }
 
+usage_error() {
+    printf 'error: %s\n\n' "$*" >&2
+    usage >&2
+    exit 2
+}
+
+need_value() {
+    local option=$1
+    shift
+    if (($# < 2)) || [[ ${2-} == --* ]]; then
+        usage_error "$option needs a value"
+    fi
+}
+
 while (($#)); do
     case "$1" in
-        --out-dir) out_dir=${2-}; shift 2 ;;
-        --cc) cc=${2-}; shift 2 ;;
-        --cmake) cmake_bin=${2-}; shift 2 ;;
+        --out-dir) need_value "$1" "$@"; out_dir=$2; shift 2 ;;
+        --cc) need_value "$1" "$@"; cc=$2; shift 2 ;;
+        --cmake) need_value "$1" "$@"; cmake_bin=$2; shift 2 ;;
         --no-cmake) want_cmake=0; shift ;;
         --no-mingw) want_mingw=0; shift ;;
         --no-sanitize) want_sanitize=0; shift ;;
         -h|--help) usage; exit 0 ;;
-        *) printf 'unknown option: %s\n\n' "$1" >&2; usage >&2; exit 2 ;;
+        *) usage_error "unknown option: $1" ;;
     esac
 done
 
-if [[ -z $out_dir ]]; then
-    printf 'error: --out-dir needs a value\n' >&2
-    exit 2
+abs_path() {
+    if command -v realpath >/dev/null 2>&1; then
+        realpath -m -- "$1"
+    else
+        (cd "$(dirname "$1")" && printf '%s/%s\n' "$PWD" "$(basename "$1")")
+    fi
+}
+
+repo_abs=$(abs_path "$repo")
+out_abs=$(abs_path "$out_dir")
+
+if [[ $out_abs == / ]]; then
+    usage_error "refusing to use the filesystem root as the output directory"
 fi
+if [[ $out_abs == "$repo_abs" ]]; then
+    usage_error "refusing to use the repository itself as the output directory"
+fi
+if [[ $repo_abs == "$out_abs"/* ]]; then
+    usage_error "refusing an output directory that contains the repository: $out_abs"
+fi
+if [[ -e $out_abs && ! -d $out_abs ]]; then
+    usage_error "output path exists and is not a directory: $out_abs"
+fi
+if [[ -d $out_abs && ! -f $out_abs/.mvci-check-offline ]] \
+        && [[ -n $(ls -A "$out_abs" 2>/dev/null) ]]; then
+    usage_error "refusing to clean a non-empty directory this script did not create: $out_abs"
+fi
+
 if ! command -v "$cc" >/dev/null 2>&1; then
     printf 'FAIL  native C compiler not found: %s\n' "$cc" >&2
     exit 2
 fi
 
-ctest_bin=""
-if command -v "$cmake_bin" >/dev/null 2>&1; then
-    ctest_bin="$(dirname "$(command -v "$cmake_bin")")/ctest"
-    if [[ ! -x $ctest_bin ]]; then
-        ctest_bin=$(command -v ctest || true)
-    fi
+# The manifest is the single test list for CMake, the direct path and the
+# sanitizer path. Refuse to run with an unreadable or malformed one rather
+# than silently testing less.
+manifest="$repo/test/offline-tests.txt"
+if [[ ! -f $manifest ]]; then
+    printf 'FAIL  offline test manifest not found: %s\n' "$manifest" >&2
+    exit 2
 fi
 
-case "$out_dir" in
-    /*) ;;
-    *) out_dir="$PWD/$out_dir" ;;
+case "$(uname -s)" in
+    Darwin) host_class=mac ;;
+    MINGW*|MSYS*|CYGWIN*) host_class=win ;;
+    *) host_class=gnu ;;
 esac
-mkdir -p "$out_dir" || exit 2
-rm -rf "$out_dir/logs"
-mkdir -p "$out_dir/logs" || exit 2
+
+host_supported() {
+    case "$1" in
+        any) return 0 ;;
+        posix) [[ $host_class != win ]] ;;
+        gnu) [[ $host_class == gnu ]] ;;
+        *) return 1 ;;
+    esac
+}
+
+mkdir -p "$out_abs" || exit 2
+: >"$out_abs/.mvci-check-offline" || exit 2
+rm -rf "$out_abs/logs" "$out_abs/native" "$out_abs/cmake-native" \
+       "$out_abs/abi" "$out_abs/sanitize" "$out_abs/windows-32" \
+       "$out_abs/windows-64"
+mkdir -p "$out_abs/logs" || exit 2
 
 pass_n=0
 fail_n=0
@@ -127,84 +174,119 @@ first_reason() {
     printf '%s' "${line:-see log}"
 }
 
+# A missing sanitizer runtime is diagnosed from the linker message. Any other
+# probe failure is a real build failure and must not be reported as a skip.
+sanitizer_runtime_missing() {
+    grep -qE 'cannot find -l(asan|ubsan|sanitizer)|libasan|libubsan|libclang_rt\.(asan|ubsan)' "$1"
+}
+
 cflags=(-std=gnu11 -O2 -Wall -Wextra -Wno-deprecated-declarations
         -I"$repo/include" -I"$repo/src")
 
 link_flags=(-pthread)
-if [[ $(uname -s) != Darwin ]]; then
+if [[ $host_class != mac ]]; then
     link_flags=(-lcrypto "${link_flags[@]}")
 fi
 
-no_mock=" ${MVCI_OFFLINE_TESTS_NO_MOCK:-} "
-no_mock=${no_mock//;/ }
-is_no_mock() { [[ $no_mock == *" $1 "* ]]; }
-no_mock_cmake=${no_mock// /;}
-no_mock_cmake=${no_mock_cmake#;}
-no_mock_cmake=${no_mock_cmake%;}
+# Read and validate the manifest once. Malformed lines are setup errors.
+manifest_lines=()
+while IFS= read -r line || [[ -n $line ]]; do
+    line=${line%$'\r'}
+    [[ -z ${line//[[:space:]]/} ]] && continue
+    [[ $line == \#* ]] && continue
+    IFS='|' read -r m_name m_ctest m_sources m_defines m_includes m_wraps m_hosts m_note <<<"$line"
+    if [[ -z ${m_name:-} || -z ${m_ctest:-} || -z ${m_sources:-} \
+            || -z ${m_hosts:-} || -z ${m_note:-} ]]; then
+        printf 'FAIL  malformed manifest line: %s\n' "$line" >&2
+        exit 2
+    fi
+    case "$m_hosts" in
+        any|posix|gnu) ;;
+        *) printf 'FAIL  unknown host class %s in manifest line: %s\n' "$m_hosts" "$line" >&2; exit 2 ;;
+    esac
+    manifest_lines+=("$line")
+done <"$manifest"
 
-# A standalone test is test/mvci_<area>_test.c other than the sequence test.
-extra_tests=()
-while IFS= read -r src; do
-    [[ -n $src ]] || continue
-    name=$(basename "$src" .c)
-    [[ $name == mvci_seq_test ]] && continue
-    extra_tests+=("$name")
-done < <(find "$repo/test" -maxdepth 1 -type f -name 'mvci_*_test.c' -print | sort)
+# split_field <field> <array-name>: '-' means empty; otherwise split on spaces.
+split_field() {
+    local value=$1
+    local -n _out=$2
+    _out=()
+    [[ $value == "-" || -z $value ]] && return 0
+    read -r -a _out <<<"$value"
+}
 
 printf 'libMVCI offline check\n'
 printf '  repo:      %s\n' "$repo"
-printf '  output:    %s\n' "$out_dir"
+printf '  output:    %s\n' "$out_abs"
 printf '  compiler:  %s (%s)\n' "$(command -v "$cc")" "$("$cc" --version 2>/dev/null | head -1)"
 if command -v "$cmake_bin" >/dev/null 2>&1; then
     printf '  cmake:     %s\n' "$("$cmake_bin" --version 2>/dev/null | head -1)"
 else
     printf '  cmake:     not found (%s)\n' "$cmake_bin"
 fi
-printf '  extra tests: '
-if ((${#extra_tests[@]})); then
-    printf '%s\n' "${extra_tests[*]}"
-else
-    printf '(none beyond the codec and sequence tests)\n'
+printf '  host:      %s\n' "$host_class"
+
+ctest_bin=""
+if command -v "$cmake_bin" >/dev/null 2>&1; then
+    ctest_bin="$(dirname "$(command -v "$cmake_bin")")/ctest"
+    if [[ ! -x $ctest_bin ]]; then
+        ctest_bin=$(command -v ctest || true)
+    fi
 fi
+
+# Report host-limited tests once for every path.
+section "Platform test scope"
+for line in "${manifest_lines[@]}"; do
+    IFS='|' read -r m_name m_ctest m_sources m_defines m_includes m_wraps m_hosts m_note <<<"$line"
+    if host_supported "$m_hosts"; then
+        printf '  RUN   %s\n' "$m_name"
+    else
+        skip "$m_name: needs a $m_hosts host ($m_note)"
+    fi
+done
 
 # --------------------------------------------------------------------------
 section "Native build and hardware-free tests"
 # --------------------------------------------------------------------------
-native_dir="$out_dir/native"
-rm -rf "$native_dir"
+native_dir="$out_abs/native"
 mkdir -p "$native_dir"
 native_lib=""
 native_step_ok=0
+ctest_ran=0
 
 if [[ $want_cmake != 0 ]] && command -v "$cmake_bin" >/dev/null 2>&1; then
-    cmake_dir="$out_dir/cmake-native"
-    rm -rf "$cmake_dir"
-    if run_logged "$out_dir/logs/cmake-configure.log" \
+    cmake_dir="$out_abs/cmake-native"
+    if run_logged "$out_abs/logs/cmake-configure.log" \
             "$cmake_bin" -S "$repo" -B "$cmake_dir" \
             -DCMAKE_BUILD_TYPE=Release -DMVCI_BUILD_TESTS=ON -DMVCI_INSTALL=OFF \
-            -DMVCI_OFFLINE_TESTS_NO_MOCK="$no_mock_cmake" \
-        && run_logged "$out_dir/logs/cmake-build.log" \
+            -DCMAKE_C_COMPILER="$cc" \
+        && run_logged "$out_abs/logs/cmake-build.log" \
             "$cmake_bin" --build "$cmake_dir" --parallel; then
         native_lib=$(find "$cmake_dir" -maxdepth 2 -type f \
-            \( -name 'libMVCI.so*' -o -name 'libMVCI*.dylib' \) | head -1)
+            \( -name 'libMVCI.so*' -o -name 'libMVCI*.dylib' \) | sort | head -1)
         if [[ -z $native_lib ]]; then
             fail "CMake native build produced no libMVCI shared library"
         else
             native_step_ok=1
             if [[ -z $ctest_bin ]]; then
                 skip "CTest not found next to $cmake_bin; the CMake build ran but no tests ran"
-            elif run_logged "$out_dir/logs/ctest.log" \
-                    "$ctest_bin" --test-dir "$cmake_dir" --output-on-failure; then
-                pass "CMake build and CTest (no-argument tests)"
             else
-                fail "CTest (see $out_dir/logs/ctest.log)"
-            fi
-            if grep -q 'No tests were found' "$out_dir/logs/ctest.log" 2>/dev/null; then
-                fail "CTest discovered no tests to run"
+                ctest_ran=1
+                if run_logged "$out_abs/logs/ctest.log" \
+                        "$ctest_bin" --test-dir "$cmake_dir" --output-on-failure; then
+                    if grep -q 'No tests were found' "$out_abs/logs/ctest.log"; then
+                        fail "CTest discovered no tests to run"
+                    else
+                        pass "CMake build and CTest (no-argument manifest tests)"
+                    fi
+                else
+                    fail "CTest (see $out_abs/logs/ctest.log)"
+                fi
             fi
         fi
     else
-        fail "CMake configure/build (see $out_dir/logs)"
+        fail "CMake configure/build (see $out_abs/logs)"
     fi
 else
     if [[ $want_cmake == 0 ]]; then
@@ -212,11 +294,13 @@ else
     else
         skip "CMake not found ('$cmake_bin' is not on PATH); used the direct compiler path"
     fi
+fi
 
+if [[ $ctest_ran == 0 ]]; then
     native_lib="$native_dir/libMVCI.so"
-    [[ $(uname -s) == Darwin ]] && native_lib="$native_dir/libMVCI.dylib"
+    [[ $host_class == mac ]] && native_lib="$native_dir/libMVCI.dylib"
 
-    if run_logged "$out_dir/logs/native-lib.log" \
+    if run_logged "$out_abs/logs/native-lib.log" \
             "$cc" "${cflags[@]}" -fPIC -fvisibility=hidden -DMVCI_BUILDING_DLL \
             -shared "$repo/src/passthru.c" "$repo/src/serial.c" \
             "$repo/src/io.c" "$repo/src/des.c" "${link_flags[@]}" \
@@ -224,66 +308,47 @@ else
         pass "native shared library build ($cc)"
         native_step_ok=1
     else
-        fail "native shared library build (see $out_dir/logs/native-lib.log)"
+        fail "native shared library build (see $out_abs/logs/native-lib.log)"
     fi
 
-    # <name> <sources...> for one no-argument test binary.
+    # build_direct_test <name> <sources...>
     build_direct_test() {
         local name=$1
         shift
-        run_logged "$out_dir/logs/$name-build.log" \
-            "$cc" "${cflags[@]}" "$@" "${link_flags[@]}" -o "$native_dir/$name"
+        local def_args=() inc_args=() wrap_args=() word
+        for word in "${def_words[@]}"; do def_args+=("-D$word"); done
+        for word in "${inc_words[@]}"; do inc_args+=("-I$repo/$word"); done
+        for word in "${wrap_words[@]}"; do wrap_args+=("-Wl,--wrap=$word"); done
+        run_logged "$out_abs/logs/$name-build.log" \
+            "$cc" "${cflags[@]}" "${def_args[@]}" "${inc_args[@]}" \
+            "${wrap_args[@]}" "$@" "${link_flags[@]}" -o "$native_dir/$name"
     }
 
-    if build_direct_test mvci_test \
-            "$repo/test/mvci_test.c" "$repo/src/serial.c" "$repo/src/io.c" "$repo/src/des.c"; then
-        if run_logged "$out_dir/logs/mvci_test.log" "$native_dir/mvci_test"; then
-            pass "mvci_test (codec self-test, no arguments)"
-        else
-            fail "mvci_test (no arguments)"
-        fi
-    else
-        fail "mvci_test build"
-    fi
-
-    seq_sources=("$repo/test/mvci_seq_test.c" "$repo/test/mock_io.c"
-                 "$repo/src/passthru.c" "$repo/src/serial.c" "$repo/src/des.c")
-    if build_direct_test mvci_seq_test "${seq_sources[@]}"; then
-        if run_logged "$out_dir/logs/mvci_seq_test.log" "$native_dir/mvci_seq_test"; then
-            pass "mvci_seq_test (provider sequence, no arguments)"
-        else
-            fail "mvci_seq_test (no arguments)"
-        fi
-    else
-        fail "mvci_seq_test build"
-    fi
-
-    if ((${#extra_tests[@]})); then
-        for name in "${extra_tests[@]}"; do
-            sources=("$repo/test/$name.c" "$repo/src/passthru.c"
-                     "$repo/src/serial.c" "$repo/src/des.c")
-            if ! is_no_mock "$name"; then
-                sources+=("$repo/test/mock_io.c")
-            fi
-            [[ -f "$repo/test/${name}_support.c" ]] && sources+=("$repo/test/${name}_support.c")
-            if build_direct_test "$name" "${sources[@]}"; then
-                if run_logged "$out_dir/logs/$name.log" "$native_dir/$name"; then
-                    pass "$name (no arguments)"
-                else
-                    fail "$name (no arguments)"
-                fi
+    for line in "${manifest_lines[@]}"; do
+        IFS='|' read -r m_name m_ctest m_sources m_defines m_includes m_wraps m_hosts m_note <<<"$line"
+        host_supported "$m_hosts" || continue
+        split_field "$m_sources" source_words
+        split_field "$m_defines" def_words
+        split_field "$m_includes" inc_words
+        split_field "$m_wraps" wrap_words
+        source_paths=()
+        for word in "${source_words[@]}"; do source_paths+=("$repo/$word"); done
+        if build_direct_test "$m_name" "${source_paths[@]}"; then
+            if run_logged "$out_abs/logs/$m_name.log" "$native_dir/$m_name"; then
+                pass "$m_name (no arguments)"
             else
-                fail "$name build"
+                fail "$m_name (no arguments)"
             fi
-        done
-    fi
+        else
+            fail "$m_name build"
+        fi
+    done
 fi
 
 # --------------------------------------------------------------------------
 section "Fixed-width J2534 ABI"
 # --------------------------------------------------------------------------
-abi_dir="$out_dir/abi"
-rm -rf "$abi_dir"
+abi_dir="$out_abs/abi"
 mkdir -p "$abi_dir"
 cat >"$abi_dir/abi_probe.c" <<'EOF'
 /* Generated by tools/check-offline.sh. The J2534 ABI is fixed-width: these
@@ -309,11 +374,11 @@ _Static_assert(offsetof(SCONFIG_LIST, ConfigPtr) >= 4, "ConfigPtr offset");
 int main(void) { return 0; }
 EOF
 
-if run_logged "$out_dir/logs/abi-native.log" \
+if run_logged "$out_abs/logs/abi-native.log" \
         "$cc" -std=gnu11 -I"$repo/include" -fsyntax-only "$abi_dir/abi_probe.c"; then
     pass "native fixed-width ABI assertions ($cc)"
 else
-    fail "native fixed-width ABI assertions (see $out_dir/logs/abi-native.log)"
+    fail "native fixed-width ABI assertions (see $out_abs/logs/abi-native.log)"
 fi
 
 required_exports=(
@@ -329,7 +394,7 @@ if [[ $native_step_ok == 0 || -z $native_lib || ! -f $native_lib ]]; then
 elif ! command -v "$nm_bin" >/dev/null 2>&1; then
     skip "native export set: '$nm_bin' is not on PATH"
 else
-    if [[ $(uname -s) == Darwin ]]; then
+    if [[ $host_class == mac ]]; then
         nm_args=(-gU)
     else
         nm_args=(-D --defined-only)
@@ -374,22 +439,21 @@ else
         fi
         mingw_cc="$triple-gcc"
         mingw_objdump="$triple-objdump"
-        win_dir="$out_dir/windows-$arch"
+        win_dir="$out_abs/windows-$arch"
         dll="$win_dir/MVCI$arch.dll"
 
         if ! command -v "$mingw_cc" >/dev/null 2>&1; then
             skip "Windows x$arch DLL: $mingw_cc not found (no MinGW compiler for this architecture)"
             continue
         fi
-        rm -rf "$win_dir"
         mkdir -p "$win_dir"
 
-        if ! run_logged "$out_dir/logs/windows-$arch.log" \
+        if ! run_logged "$out_abs/logs/windows-$arch.log" \
                 "$mingw_cc" -std=gnu11 -O2 -Wall -Wextra -DMVCI_BUILDING_DLL \
                 -I"$repo/include" -I"$repo/src" -shared \
                 "$repo/src/passthru.c" "$repo/src/serial.c" "$repo/src/io.c" \
                 "$repo/src/des.c" "$repo/src/mvci.def" -lbcrypt -o "$dll"; then
-            fail "Windows x$arch DLL build (see $out_dir/logs/windows-$arch.log)"
+            fail "Windows x$arch DLL build (see $out_abs/logs/windows-$arch.log)"
             continue
         fi
         pass "Windows x$arch DLL build ($mingw_cc)"
@@ -410,11 +474,11 @@ _Static_assert(sizeof(SCONFIG_LIST) == 16, "x64 SCONFIG_LIST");
 #endif
 int main(void) { return 0; }
 EOF
-        if run_logged "$out_dir/logs/windows-$arch-abi.log" \
+        if run_logged "$out_abs/logs/windows-$arch-abi.log" \
                 "$mingw_cc" -std=gnu11 -I"$repo/include" -fsyntax-only "$win_dir/abi_probe.c"; then
             pass "Windows x$arch fixed-width ABI assertions"
         else
-            fail "Windows x$arch fixed-width ABI assertions (see $out_dir/logs/windows-$arch-abi.log)"
+            fail "Windows x$arch fixed-width ABI assertions (see $out_abs/logs/windows-$arch-abi.log)"
         fi
 
         if ! command -v "$mingw_objdump" >/dev/null 2>&1; then
@@ -453,71 +517,62 @@ EOF
     done
 fi
 
-if [[ $(uname -s) != Darwin ]]; then
-    skip "macOS backend: no Darwin compiler or sysroot on this host; the CommonCrypto path is compiled only on macOS"
+if [[ $host_class != mac ]]; then
+    skip "macOS library build: no Darwin compiler or sysroot on this host; the CommonCrypto path is compiled only on macOS"
 fi
 
 # --------------------------------------------------------------------------
 section "Sanitizer build (ASAN + UBSAN)"
 # --------------------------------------------------------------------------
-san_dir="$out_dir/sanitize"
+san_dir="$out_abs/sanitize"
 if [[ $want_sanitize == 0 ]]; then
     skip "sanitizer build disabled by --no-sanitize"
 else
-    rm -rf "$san_dir"
     mkdir -p "$san_dir"
     printf 'int main(void) { return 0; }\n' >"$san_dir/probe.c"
     if ! "$cc" -fsanitize=address,undefined "$san_dir/probe.c" -o "$san_dir/probe" \
-            >"$out_dir/logs/sanitize-probe.log" 2>&1; then
-        skip "sanitizer runtime unavailable: $cc cannot link -fsanitize=address,undefined ($(first_reason "$out_dir/logs/sanitize-probe.log"))"
+            >"$out_abs/logs/sanitize-probe.log" 2>&1; then
+        if sanitizer_runtime_missing "$out_abs/logs/sanitize-probe.log"; then
+            skip "sanitizer build: the $cc sanitizer runtime is absent ($(first_reason "$out_abs/logs/sanitize-probe.log")); no test ran under ASAN/UBSAN"
+        else
+            fail "sanitizer probe build failed for a reason other than a missing runtime: $(first_reason "$out_abs/logs/sanitize-probe.log")"
+        fi
     else
         san_flags=("${cflags[@]}" -O1 -g -fsanitize=address,undefined
                   -fno-sanitize-recover=undefined -fno-omit-frame-pointer)
 
+        # san_build <name> <sources...>
         san_build() {
             local name=$1
             shift
-            run_logged "$out_dir/logs/sanitize-$name-build.log" \
-                "$cc" "${san_flags[@]}" "$@" "${link_flags[@]}" -o "$san_dir/$name"
-        }
-        san_run() {
-            local name=$1
-            if run_logged "$out_dir/logs/sanitize-$name.log" "$san_dir/$name"; then
-                pass "sanitizer $name (no arguments)"
-            else
-                fail "sanitizer $name (no arguments)"
-            fi
+            local def_args=() inc_args=() wrap_args=() word
+            for word in "${def_words[@]}"; do def_args+=("-D$word"); done
+            for word in "${inc_words[@]}"; do inc_args+=("-I$repo/$word"); done
+            for word in "${wrap_words[@]}"; do wrap_args+=("-Wl,--wrap=$word"); done
+            run_logged "$out_abs/logs/sanitize-$name-build.log" \
+                "$cc" "${san_flags[@]}" "${def_args[@]}" "${inc_args[@]}" \
+                "${wrap_args[@]}" "$@" "${link_flags[@]}" -o "$san_dir/$name"
         }
 
-        if san_build mvci_test "$repo/test/mvci_test.c" "$repo/src/serial.c" \
-                "$repo/src/io.c" "$repo/src/des.c"; then
-            san_run mvci_test
-        else
-            fail "sanitizer mvci_test build"
-        fi
-
-        if san_build mvci_seq_test "$repo/test/mvci_seq_test.c" "$repo/test/mock_io.c" \
-                "$repo/src/passthru.c" "$repo/src/serial.c" "$repo/src/des.c"; then
-            san_run mvci_seq_test
-        else
-            fail "sanitizer mvci_seq_test build"
-        fi
-
-        if ((${#extra_tests[@]})); then
-            for name in "${extra_tests[@]}"; do
-                sources=("$repo/test/$name.c" "$repo/src/passthru.c"
-                         "$repo/src/serial.c" "$repo/src/des.c")
-                if ! is_no_mock "$name"; then
-                    sources+=("$repo/test/mock_io.c")
-                fi
-                [[ -f "$repo/test/${name}_support.c" ]] && sources+=("$repo/test/${name}_support.c")
-                if san_build "$name" "${sources[@]}"; then
-                    san_run "$name"
+        for line in "${manifest_lines[@]}"; do
+            IFS='|' read -r m_name m_ctest m_sources m_defines m_includes m_wraps m_hosts m_note <<<"$line"
+            host_supported "$m_hosts" || continue
+            split_field "$m_sources" source_words
+            split_field "$m_defines" def_words
+            split_field "$m_includes" inc_words
+            split_field "$m_wraps" wrap_words
+            source_paths=()
+            for word in "${source_words[@]}"; do source_paths+=("$repo/$word"); done
+            if san_build "$m_name" "${source_paths[@]}"; then
+                if run_logged "$out_abs/logs/sanitize-$m_name.log" "$san_dir/$m_name"; then
+                    pass "sanitizer $m_name (no arguments)"
                 else
-                    fail "sanitizer $name build"
+                    fail "sanitizer $m_name (no arguments)"
                 fi
-            done
-        fi
+            else
+                fail "sanitizer $m_name build"
+            fi
+        done
     fi
 fi
 
@@ -529,6 +584,10 @@ printf '  checks failed:  %d\n' "$fail_n"
 printf '  checks skipped: %d\n' "$skip_n"
 if ((fail_n)); then
     printf 'Result: FAIL (see the failure reasons above)\n'
+    exit 1
+fi
+if ((pass_n == 0)); then
+    printf 'Result: FAIL (no check ran)\n'
     exit 1
 fi
 printf 'Result: PASS (offline only; physical timing and adapter behaviour remain unproven)\n'
