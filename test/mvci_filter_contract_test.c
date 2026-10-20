@@ -25,23 +25,37 @@ int __wrap_nanosleep(const struct timespec *t, struct timespec *remaining)
 
 /* Reuse the existing cable script. Add deterministic transport failures,
  * without changing its reply bytes or requiring a new shared mock API. */
+#define mvci_io_write_timeout scripted_write_timeout
 #define mvci_io_write scripted_write
 #define mvci_io_read scripted_read
 #define mvci_io_purge_rx scripted_purge
 #include "mock_io.c"
 #undef mvci_io_write
+#undef mvci_io_write_timeout
 #undef mvci_io_read
 #undef mvci_io_purge_rx
 
 static uint8_t fail_opcode;
+static int fail_as_reply;
 static unsigned fail_after, purges;
 int mvci_io_write(mvci_io_t *io, const uint8_t *buf, int n)
 {
     uint8_t inner[MVCI_MAX_INNER];
     int r = mvci_frame_decrypt(mock_key(), buf, (size_t)n, inner, sizeof inner);
-    if (fail_after && r >= 3 && inner[2] == fail_opcode && --fail_after == 0)
-        return -1;
+    if (fail_after && r >= 3 && inner[2] == fail_opcode && --fail_after == 0) {
+        if (!fail_as_reply) return -1;
+        int result = scripted_write(io, buf, n);
+        scripted_purge(io);
+        uint8_t rejected[8] = {2, 0, inner[2], 8};
+        queue_status(rejected);
+        return result;
+    }
     return scripted_write(io, buf, n);
+}
+int mvci_io_write_timeout(mvci_io_t *io, const uint8_t *buf, int n, int timeout_ms)
+{
+    (void)timeout_ms;
+    return mvci_io_write(io, buf, n);
 }
 int mvci_io_read(mvci_io_t *io, uint8_t *buf, int n, int timeout_ms)
 {
@@ -143,6 +157,11 @@ static void test_filter_admission(void)
     pattern.TxFlags = 0;
     fail_opcode = 0x0b; fail_after = 1;
     refuse_filter(ch, PASS_FILTER, &mask, &pattern, NULL, ERR_FAILED);
+    /* A failed write can leave a partial command on the cable. The new
+     * pipeline must refuse subsequent commands until a fresh context. */
+    refuse_filter(ch, PASS_FILTER, &mask, &pattern, NULL, ERR_FAILED);
+    CHECK(PassThruClose(dev) == STATUS_NOERROR);
+    ch = open_channel(&dev);
     CHECK(add_filter(ch, &fid) == STATUS_NOERROR && fid == 1);
     uint8_t inner[MVCI_MAX_INNER];
     CHECK(frame_inner(mock_frame_count() - 1, inner) >= 17);
@@ -185,13 +204,15 @@ static void test_failed_stop_and_partial_clear(void)
 {
     J2534_ULONG dev = 0, ch = open_channel(&dev), ids[3];
     for (unsigned i = 0; i < 3; i++) CHECK(add_filter(ch, &ids[i]) == STATUS_NOERROR);
+    fail_as_reply = 1;
     fail_opcode = 0x0c; fail_after = 1;
     CHECK(PassThruStopMsgFilter(ch, ids[0]) == ERR_FAILED);
     /* First stop succeeds; second fails. Only the first entry is removed. */
     fail_after = 2;
     int before = mock_frame_count();
     CHECK(PassThruIoctl(ch, CLEAR_MSG_FILTERS, NULL, NULL) == ERR_FAILED);
-    CHECK(mock_frame_count() == before + 1);
+    CHECK(mock_frame_count() == before + 2);
+    CHECK(filter_handle(before + 1, 0x0c) == 0x000e7a02);
     CHECK(filter_handle(before, 0x0c) == 0x000e7a01);
     char error[128];
     CHECK(PassThruGetLastError(error) == STATUS_NOERROR);
@@ -278,6 +299,7 @@ static void test_rx_tx_and_periodic_clear(void)
     uint8_t inner[MVCI_MAX_INNER];
     CHECK(frame_inner(mock_frame_count() - 1, inner) >= 8);
     CHECK(inner[2] == 0x0e && inner[3] == 9 && get_u32(inner + 4) == ISO9141);
+    fail_as_reply = 1;
     fail_opcode = 0x0e; fail_after = 1;
     CHECK(PassThruIoctl(ch, CLEAR_PERIODIC_MSGS, NULL, NULL) == ERR_FAILED);
     /* Timing read-back must remain unsupported even after an ACKed SET. */
