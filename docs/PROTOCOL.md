@@ -361,7 +361,9 @@ Open or Connect is refused instead of wrapping.
 
 ### 8.3 Recovery after an unknown result
 
-A lost or ambiguous result poisons the session. This covers a timeout with an outstanding command,
+A lost or ambiguous result poisons the session. A read poll that passes a public
+read deadline remains pending for a later read; no new cable command may pass
+it. This covers a timeout with an outstanding non-poll command,
 a partial write, a malformed or desynchronised reply, an unanswered Disconnect,
 and a read poll cancelled after it was sent. A purge, quiet interval, later
 clean ACK, or a new Connect in the same session cannot prove recovery. Only

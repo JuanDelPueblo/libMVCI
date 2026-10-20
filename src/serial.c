@@ -252,6 +252,7 @@ struct mvci_ctx {
     uint8_t          rx_frame[MVCI_MAX_FRAME];
     int              rx_used;
     int              poisoned; /* Unknown outstanding result: close/reopen required. */
+    int              poll_pending; /* Issued read poll awaiting its one result. */
     int              overflow;
     int              rx_purge_failed;
     mvci_mutex_t     lock;       /* serialises device I/O */
@@ -507,7 +508,7 @@ static int transact_until_locked(mvci_ctx_t *ctx, const uint8_t *inner, size_t i
                                  int cancellable)
 {
     if (ctx->rx_purge_failed) return MVCI_PIPE_IO;
-    if (ctx->poisoned) return MVCI_PIPE_DESYNC;
+    if (ctx->poisoned || ctx->poll_pending) return MVCI_PIPE_DESYNC;
     if ((int32_t)(deadline - mvci_now_ms()) <= 0) return MVCI_PIPE_TIMEOUT;
     uint8_t frame[MVCI_MAX_FRAME], received[MVCI_MAX_INNER];
     int n = mvci_frame_enc(ctx->key, inner, inner_len, frame, sizeof frame);
@@ -662,6 +663,12 @@ int mvci_disconnect(mvci_ctx_t *ctx)
     int n = mvci_frame_enc(ctx->key, in, sizeof in, frame, sizeof frame);
     if (!ctx->have_key || n < 0) return -1;
     mvci_mutex_lock(&ctx->lock);
+    /* A pending encrypted poll reply could be consumed as the plaintext
+     * Disconnect reply after a purge. Keep the session intact instead. */
+    if (ctx->poll_pending && !ctx->poisoned) {
+        mvci_mutex_unlock(&ctx->lock);
+        return -1;
+    }
     if (mvci_io_purge_rx_checked(ctx->io) != 0) {
         ctx->rx_purge_failed = 1;
         mvci_mutex_unlock(&ctx->lock);
@@ -815,7 +822,7 @@ int mvci_poll_until(mvci_ctx_t *ctx, uint8_t *msg_out, size_t cap,
         r = MVCI_PIPE_OVERFLOW;
     } else if (!*work_left) {
         r = 0;
-    } else if (ctx->pending_count) {
+    } else if (ctx->pending_count && !ctx->poll_pending) {
         r = ctx->pending_len[0];
         memcpy(resp, ctx->pending[0], (size_t)r);
         from_pending = 1; /* Commit removal only within the caller deadline. */
@@ -823,18 +830,43 @@ int mvci_poll_until(mvci_ctx_t *ctx, uint8_t *msg_out, size_t cap,
     } else if (ctx->poisoned) {
         r = MVCI_PIPE_DESYNC;
     } else {
-        r = drain_record(ctx, resp, deadline, timed, work_left);
-        if (!r && timed && *work_left && !ctx->rx_used) {
+        /* Once a poll is sent, its next record belongs to that poll. Do not
+         * drain it as unsolicited input across a public read deadline. */
+        r = ctx->poll_pending ? 0 : drain_record(ctx, resp, deadline, timed, work_left);
+        if (!r && timed && *work_left && !ctx->rx_used && !ctx->poll_pending) {
             int n = mvci_inner_read_poll(ctx->proto, in);
-            r = cancel_requested(ctx) ? MVCI_PIPE_CANCELED :
-                transact_until_locked(ctx, in, n, resp, sizeof resp, deadline, 1);
-            if (r > 0) --*work_left;
+            int remaining = (int32_t)(deadline - mvci_now_ms());
+            if (cancel_requested(ctx)) r = MVCI_PIPE_CANCELED;
+            else if (remaining <= 0) r = MVCI_PIPE_TIMEOUT;
+            else {
+                uint8_t frame[MVCI_MAX_FRAME];
+                int length = mvci_frame_enc(ctx->key, in, n, frame, sizeof frame);
+                if (length < 0) r = MVCI_PIPE_DESYNC;
+                else {
+                    dbg_hex("TX inner:", in, n);
+                    int w = mvci_io_write_timeout(ctx->io, frame, length, remaining);
+                    if (w == length) ctx->poll_pending = 1;
+                    else { ctx->poisoned = 1; r = w < 0 ? MVCI_PIPE_IO : MVCI_PIPE_TIMEOUT; }
+                }
+            }
+        }
+        if (!r && ctx->poll_pending && *work_left) {
+            r = receive_inner_until(ctx, resp, deadline, timed, timed);
+            if (r > 0) {
+                ctx->poll_pending = 0;
+                --*work_left;
+                dbg_hex("RX inner:", resp, r);
+            }
         } else if (!r && timed && *work_left && ctx->rx_used) {
             r = receive_inner_until(ctx, resp, deadline, 1, 1);
             if (r > 0) --*work_left;
         }
-        /* A buffered-read timeout has no outstanding command. Retain its
-         * complete or partial frame; a command timeout poisons itself above. */
+        /* A read deadline keeps its pending poll and partial frame. A
+         * cancellation after the send boundary still loses correlation. */
+        if (r == MVCI_PIPE_CANCELED && ctx->poll_pending) {
+            ctx->poll_pending = 0;
+            ctx->poisoned = 1;
+        }
         if (r < 0 && r != MVCI_PIPE_TIMEOUT && r != MVCI_PIPE_CANCELED)
             ctx->poisoned = 1;
     }
@@ -878,7 +910,7 @@ int mvci_reset_session(mvci_ctx_t *ctx)
     if (!ctx || !ctx->have_key) return MVCI_PIPE_DESYNC;
     mvci_mutex_lock(&ctx->lock);
     int r = 0;
-    if (ctx->poisoned) {
+    if (ctx->poisoned || ctx->poll_pending) {
         r = MVCI_PIPE_DESYNC;
     } else if (mvci_io_purge_rx_checked(ctx->io) != 0) {
         ctx->rx_purge_failed = 1;
@@ -897,6 +929,10 @@ int mvci_clear_rx_buffer(mvci_ctx_t *ctx)
 {
     if (!ctx || !ctx->have_key) return -1;
     mvci_mutex_lock(&ctx->lock);
+    if (ctx->poll_pending) {
+        mvci_mutex_unlock(&ctx->lock);
+        return -1;
+    }
     if (mvci_io_purge_rx_checked(ctx->io) != 0) {
         ctx->rx_purge_failed = 1;
         mvci_mutex_unlock(&ctx->lock);

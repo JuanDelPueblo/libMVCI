@@ -85,7 +85,10 @@ physical timing, electrical behavior, or ECU acceptance.
   timed partial batch returns `ERR_TIMEOUT` and the actual count. Corruption,
   transport loss and queue overflow are errors. The pending queue holds 16
   records, and receive payloads are limited to 64 bytes. Adapter timestamps are
-  not established; no timestamp is synthesized from an assumed cable clock.
+  not established; no timestamp is synthesized from an assumed cable clock. A
+  poll still awaiting its reply at a read deadline remains pending across read
+  calls. Other cable commands wait until that reply is classified; a missing
+  reply cannot be recovered by a purge or another poll.
 - **Filters and clear operations.** Only one-byte PASS filters are supported.
   BLOCK, FLOW_CONTROL, longer descriptors and unsupported flags are refused.
   Stopping a filter frees its slot. Filter clear uses individual stop commands
@@ -95,8 +98,8 @@ physical timing, electrical behavior, or ECU acceptance.
 - **Session lifetime and recovery.** A waiting Disconnect or Close cancels a
   read at its next host I/O slice. Messages already delivered are returned;
   otherwise the read reports `ERR_FAILED`. A canceled poll that had already
-  been sent, a timeout with an outstanding command, a desync, or an incomplete
-  Disconnect write leaves an unknown
+  been sent, a timeout with an outstanding non-poll command, a desync, or an
+  incomplete Disconnect write leaves an unknown
   result: the session is poisoned and only Close/Open recovers. A purge, quiet
   interval, later clean ACK, or same-session reconnect does not establish
   recovery. Before Connect, the driver performs a host RX purge and refuses a
