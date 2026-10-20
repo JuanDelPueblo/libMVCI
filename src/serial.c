@@ -528,7 +528,7 @@ int mvci_fast_init(mvci_ctx_t *ctx, const uint8_t *init, size_t n,
         return -1;
     }
     int mlen = (int)resp[0] - 1;                 /* 08 -> 7 ECU key bytes @ off 3 */
-    if (mlen < 0 || 3 + mlen > r) return -1;
+    if (mlen <= 0 || 3 + mlen > r) return -1;
     if ((size_t)mlen > cap) return -1;
     if (mlen > 0) memcpy(resp_out, resp + 3, (size_t)mlen);
     return mlen;

@@ -41,12 +41,17 @@ static int g_poll_reply, g_device_reply_pending;
 static uint8_t g_config_status;
 static int g_five_baud_success;
 static int g_fast_reply_len;
+static int g_fast_reply_enabled;
 
 void mock_async_reply(int mode) { g_async_reply = mode; }
 void mock_poll_reply(void) { g_poll_reply = 1; }
 void mock_config_status(uint8_t status) { g_config_status = status; }
 void mock_five_baud_success(int enabled) { g_five_baud_success = enabled; }
-void mock_fast_reply_length(int length) { g_fast_reply_len = length; }
+void mock_fast_reply_length(int length)
+{
+    g_fast_reply_len = length;
+    g_fast_reply_enabled = length >= 0 && length <= MVCI_MAX_INNER - 3;
+}
 
 const uint8_t *mock_key(void) { return MOCK_KEY; }
 
@@ -162,7 +167,7 @@ static void answer(const uint8_t *inner, int ilen)
             memcpy(st, r, 8);
         }
     } else if (ilen >= 4 && inner[2] == 0x0e && inner[3] == 0x05) {
-        if (g_fast_reply_len > 0) {
+        if (g_fast_reply_enabled) {
             uint8_t r[MVCI_MAX_INNER] = {0};
             size_t n = (size_t)g_fast_reply_len + 3;
             r[0] = (uint8_t)(g_fast_reply_len + 1); r[2] = 0x0e;
@@ -171,6 +176,7 @@ static void answer(const uint8_t *inner, int ilen)
             int fn = mvci_frame_enc(MOCK_KEY, r, n, frame, sizeof frame);
             if (fn > 0) queue_bytes(frame, fn);
             g_fast_reply_len = 0;
+            g_fast_reply_enabled = 0;
             return;
         }
         /* Exact T255 OBD-disconnected fast-init reply. */
@@ -235,6 +241,7 @@ mvci_io_t *mvci_io_open(const char *port)
     g_config_status = 0;
     g_five_baud_success = 0;
     g_fast_reply_len = 0;
+    g_fast_reply_enabled = 0;
     g_protocol = 0;
     g_poll_reply = g_device_reply_pending = 0;
     return &g_io;

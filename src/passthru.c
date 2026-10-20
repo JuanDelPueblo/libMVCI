@@ -348,8 +348,8 @@ J2534_LONG J2534_API PassThruIoctl(J2534_ULONG ChannelID, J2534_ULONG IoctlID,
     case FAST_INIT: {
         PASSTHRU_MSG *in = (PASSTHRU_MSG *)pInput;
         PASSTHRU_MSG *out = (PASSTHRU_MSG *)pOutput;
-        if (!in || !out) { set_err("NULL fast init message"); return ERR_NULL_PARAMETER; }
-        if (in->DataSize == 0) { set_err("pattern-only fast init unsupported"); return ERR_NOT_SUPPORTED; }
+        if (!out) { set_err("NULL fast init output"); return ERR_NULL_PARAMETER; }
+        if (!in || in->DataSize == 0) { set_err("pattern-only fast init unsupported"); return ERR_NOT_SUPPORTED; }
         if (in->DataSize > sizeof in->Data) { set_err("fast init input too large"); return ERR_INVALID_IOCTL_VALUE; }
         uint8_t reply[61];
         int k = mvci_fast_init(s->ctx, in->Data, in->DataSize, reply, sizeof reply);
@@ -365,6 +365,7 @@ J2534_LONG J2534_API PassThruIoctl(J2534_ULONG ChannelID, J2534_ULONG IoctlID,
         memset(out, 0, sizeof *out);
         out->ProtocolID = s->proto;
         out->DataSize = (uint32_t)k;
+        out->ExtraDataIndex = out->DataSize;
         memcpy(out->Data, reply, (size_t)k);
         return STATUS_NOERROR;
     }
