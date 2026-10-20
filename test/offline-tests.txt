@@ -1,0 +1,39 @@
+# MVCI hardware-free test manifest.
+#
+# This is the single source of truth for the offline regression set. It is
+# read by CMakeLists.txt (CTest targets) and by tools/check-offline.sh (its
+# direct-compiler and sanitizer paths), so the three paths cannot drift.
+#
+# One test per line. Fields are separated by '|':
+#
+#   target | ctest name | sources | defines | include dirs | wraps | hosts | note
+#
+# sources, defines, include dirs and wraps are space-separated and relative to
+# the repository root. Use '-' for an empty field. A field must not contain
+# ';' (CMake reads it as a list separator). hosts is:
+#
+#   any    - build and run on every host
+#   posix  - every host except Windows
+#   gnu    - an ELF host whose linker supports --wrap (Linux and similar)
+#
+# note is a short statement of what the test proves; for a limited host it
+# names the missing capability. Every test runs with no arguments and needs no
+# adapter, provider, vehicle, network or proprietary runtime.
+#
+# To register another offline regression, add its source file and one line
+# here. CMake does not glob the test directory: a missing source is a
+# configure error.
+#
+mvci_test|mvci_selftest|test/mvci_test.c src/serial.c src/io.c src/des.c|-|-|-|any|codec self-test
+mvci_seq_test|mvci_seqtest|test/mvci_seq_test.c test/mock_io.c src/passthru.c src/serial.c src/des.c test/virtual_clock.c|-|-|clock_gettime nanosleep|gnu|exact adapter sequences on a virtual clock
+mvci_init_contract_test|mvci_init_contract_test|test/mvci_init_contract_test.c test/mock_io.c src/passthru.c src/serial.c src/des.c test/virtual_clock.c|-|-|clock_gettime nanosleep|gnu|init IOCTL contracts on a virtual clock
+mvci_diagnostics_test|mvci_diagnostics_test|test/mvci_diagnostics_test.c test/mock_io.c src/passthru.c src/serial.c src/des.c test/virtual_clock.c|-|-|clock_gettime nanosleep|gnu|diagnostics and per-thread error isolation
+mvci_filter_contract_test|mvci_filter_contract_test|test/mvci_filter_contract_test.c src/passthru.c src/serial.c src/des.c|-|-|clock_gettime nanosleep|gnu|filter/IOCTL contracts, includes its own transport
+mvci_pipeline_test|mvci_pipeline_test|test/mvci_pipeline_test.c src/passthru.c src/serial.c src/des.c|-|-|clock_gettime nanosleep pthread_mutex_trylock|gnu|synchronous pipeline, includes its own transport
+mvci_posix_io_test|mvci_posix_io_test|test/mvci_posix_io_test.c|-|-|open close tcsetattr tcflush ioctl poll read write clock_gettime nanosleep|gnu|POSIX transport syscalls are scripted
+mvci_codec_bounds_test|mvci_codec_bounds_test|test/mvci_codec_bounds_test.c src/serial.c src/io.c src/des.c|-|-|-|any|codec pointer, length and wire bounds
+des_cng_fault_test|des_cng_fault_test|test/des_backend_fault_test.c src/serial.c test/mock_io.c|MVCI_DES_USE_CNG|test/fake/win|-|gnu|fake CNG backend needs host OpenSSL
+des_commoncrypto_fault_test|des_commoncrypto_fault_test|test/des_backend_fault_test.c src/serial.c test/mock_io.c|MVCI_DES_USE_COMMONCRYPTO|test/fake/cc|-|gnu|fake CommonCrypto backend needs host OpenSSL
+win_io_fault_test|win_io_fault_test|test/win_io_fault_test.c|_WIN32|test/fake/win|-|posix|fake D2XX module and Windows headers
+mvci_windows_deadline_test|mvci_windows_deadline_test|test/mvci_windows_deadline_test.c src/passthru.c src/serial.c src/des.c|-|test/fake/win|clock_gettime nanosleep|gnu|public write budget includes simulated D2XX setup
+mvci_lifecycle_test|mvci_lifecycle_test|test/mvci_lifecycle_test.c src/passthru.c src/serial.c src/des.c|MVCI_TESTING|-|mvci_set_read_cancel|gnu|public lifecycle interleavings with an interposed POSIX clock and signal watchdog

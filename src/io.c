@@ -45,6 +45,7 @@ typedef FT_STATUS (WINAPI *PFN_Chars)(FT_HANDLE, UCHAR, UCHAR, UCHAR);
 typedef FT_STATUS (WINAPI *PFN_Flow)(FT_HANDLE, USHORT, UCHAR, UCHAR);
 typedef FT_STATUS (WINAPI *PFN_Lat)(FT_HANDLE, UCHAR);
 typedef FT_STATUS (WINAPI *PFN_RW)(FT_HANDLE, LPVOID, DWORD, LPDWORD);
+typedef FT_STATUS (WINAPI *PFN_Q)(FT_HANDLE, LPDWORD);
 
 static struct {
     HMODULE  dll;
@@ -56,6 +57,7 @@ static struct {
     PFN_Flow SetFlowControl;
     PFN_Lat  SetLatencyTimer;
     PFN_RW   Write, Read;
+    PFN_Q    GetQueueStatus;
 } FT;
 
 static int ft_load(void)
@@ -78,11 +80,12 @@ static int ft_load(void)
     FT.SetLatencyTimer        = (PFN_Lat)  GetProcAddress(m, "FT_SetLatencyTimer");
     FT.Write                  = (PFN_RW)   GetProcAddress(m, "FT_Write");
     FT.Read                   = (PFN_RW)   GetProcAddress(m, "FT_Read");
+    FT.GetQueueStatus         = (PFN_Q)    GetProcAddress(m, "FT_GetQueueStatus");
 
     if (!FT.OpenEx || !FT.Close || !FT.ResetDevice || !FT.ClrRts || !FT.SetDtr ||
         !FT.ClrDtr || !FT.SetBaudRate || !FT.Purge || !FT.SetTimeouts ||
         !FT.SetDataCharacteristics || !FT.SetFlowControl || !FT.SetLatencyTimer ||
-        !FT.Write || !FT.Read) {
+        !FT.Write || !FT.Read || !FT.GetQueueStatus) {
         FreeLibrary(m);
         return -1;
     }
@@ -90,7 +93,12 @@ static int ft_load(void)
     return 0;
 }
 
-struct mvci_io { FT_HANDLE h; };
+/* purge_failed: mvci_io_purge_rx() returns void, so a failed purge is kept here
+ * and fails reads and writes until a later purge succeeds, instead of leaving
+ * stale bytes to be framed. */
+struct mvci_io { FT_HANDLE h; int purge_failed; ULONG rd_ms, wr_ms; };
+
+#define FT_TRY(call)  do { if ((call) != FT_OK) goto fail; } while (0)
 
 mvci_io_t *mvci_io_open(const char *port)
 {
@@ -105,25 +113,32 @@ mvci_io_t *mvci_io_open(const char *port)
         return NULL;
     }
 
-    FT.SetBaudRate(io->h, 115200);
-    FT.SetDataCharacteristics(io->h, FT_BITS_8, FT_STOP_BITS_1, FT_PARITY_NONE);
-    FT.SetFlowControl(io->h, FT_FLOW_NONE, 0, 0);
-    FT.SetLatencyTimer(io->h, 2);
-    FT.SetTimeouts(io->h, 100, 1000);          /* default rx/tx ms */
+    FT_TRY(FT.SetBaudRate(io->h, 115200));
+    FT_TRY(FT.SetDataCharacteristics(io->h, FT_BITS_8, FT_STOP_BITS_1, FT_PARITY_NONE));
+    FT_TRY(FT.SetFlowControl(io->h, FT_FLOW_NONE, 0, 0));
+    FT_TRY(FT.SetLatencyTimer(io->h, 2));
+    FT_TRY(FT.SetTimeouts(io->h, 100, 1000));   /* default rx/tx ms */
+    io->rd_ms = 100;
+    io->wr_ms = 1000;
 
-    FT.ResetDevice(io->h);
-    FT.Purge(io->h, FT_PURGE_RX);
-    FT.ResetDevice(io->h);
+    FT_TRY(FT.ResetDevice(io->h));
+    FT_TRY(FT.Purge(io->h, FT_PURGE_RX));
+    FT_TRY(FT.ResetDevice(io->h));
 
     /* DTR pulse = MCU reset (FT_ClrRts, FT_SetDtr, 15 ms, FT_ClrDtr) */
-    FT.ClrRts(io->h);
-    FT.SetDtr(io->h);
+    FT_TRY(FT.ClrRts(io->h));
+    FT_TRY(FT.SetDtr(io->h));
     mvci_sleep_ms(15);
-    FT.ClrDtr(io->h);
+    FT_TRY(FT.ClrDtr(io->h));
 
     mvci_sleep_ms(1000);                        /* MCU boot */
-    FT.Purge(io->h, FT_PURGE_RX);
+    FT_TRY(FT.Purge(io->h, FT_PURGE_RX));
     return io;
+
+fail:
+    FT.Close(io->h);
+    free(io);
+    return NULL;
 }
 
 void mvci_io_close(mvci_io_t *io)
@@ -133,24 +148,93 @@ void mvci_io_close(mvci_io_t *io)
     free(io);
 }
 
-int mvci_io_write(mvci_io_t *io, const uint8_t *buf, int n)
+/* Timeout setup itself uses caller time. Admit blocking I/O only after its
+ * installed timeout fits the remaining absolute budget. If setup took time,
+ * use its observed cost to choose a shorter next timeout, then check again.
+ * The observation is an estimate, never a latency guarantee: expiration
+ * refuses I/O before bytes are offered. No serial write is retried. */
+static int ft_set_timeout_until(mvci_io_t *io, uint32_t deadline, int reading)
 {
-    DWORD written = 0;
-    if (FT.Write(io->h, (LPVOID)buf, (DWORD)n, &written) != FT_OK) return -1;
-    return (int)written;
+    int budget = (int32_t)(deadline - mvci_now_ms());
+    while (budget > 0) {
+        uint32_t before = mvci_now_ms();
+        ULONG rd = reading ? (ULONG)budget : io->rd_ms;
+        ULONG wr = reading ? io->wr_ms : (ULONG)budget;
+        if (FT.SetTimeouts(io->h, rd, wr) != FT_OK) return -1;
+        io->rd_ms = rd;
+        io->wr_ms = wr;
+        uint32_t after = mvci_now_ms();
+        int remaining = (int32_t)(deadline - after);
+        if (remaining <= 0) return 0;
+        if (budget <= remaining) return 1;
+        int spent = (int32_t)(after - before);
+        budget = remaining - spent;
+        if (budget <= 0) budget = 1;
+    }
+    return 0;
 }
 
+/* D2XX documents no value for a timeout of 0 (the D2XX Programmer's Guide, v1.5,
+ * describes FT_SetTimeouts only as "in milliseconds"), so 0 is never passed.
+ * The guide's FT_Write section says only FT_OK or an error code. A short count
+ * on a write timeout is documented for FT_W32_WriteFile (FT_W32_SetCommTimeouts)
+ * and is INFERRED here for FT_Write: UNPROVEN until a real D2XX run shows it.
+ * Either way is safe: a short count is returned as the partial accepted count,
+ * and a failed status is -1 even when bytes were accepted, which the caller must
+ * treat as ambiguous. The count is host acceptance, not wire transmission.
+ * This function never retries. */
+int mvci_io_write_timeout(mvci_io_t *io, const uint8_t *buf, int n, int timeout_ms)
+{
+    DWORD written = 0;
+    if (!io || n < 0 || (n > 0 && !buf) || timeout_ms < 0 || io->purge_failed) return -1;
+    if (n == 0) return 0;
+    /* No documented way to offer bytes without a wait: accept none. */
+    if (timeout_ms == 0) return 0;
+    uint32_t deadline = mvci_now_ms() + (uint32_t)timeout_ms;
+    int configured = ft_set_timeout_until(io, deadline, 0);
+    if (configured <= 0) return configured;
+    if (FT.Write(io->h, (LPVOID)buf, (DWORD)n, &written) != FT_OK) return -1;
+    return written <= (DWORD)n ? (int)written : -1;
+}
+
+int mvci_io_write(mvci_io_t *io, const uint8_t *buf, int n)
+{
+    int written = mvci_io_write_timeout(io, buf, n, 1000);
+    return written == n ? n : -1;
+}
+
+/* timeout_ms == 0 drains only what the receive queue already holds: the guide
+ * documents that FT_Read returns at once when asked for no more than
+ * FT_GetQueueStatus reports, so no D2XX timeout is involved. */
 int mvci_io_read(mvci_io_t *io, uint8_t *buf, int n, int timeout_ms)
 {
     DWORD got = 0;
-    FT.SetTimeouts(io->h, (ULONG)timeout_ms, 1000);
+    if (!io || n < 0 || (n > 0 && !buf) || timeout_ms < 0 || io->purge_failed) return -1;
+    if (n == 0) return 0;
+    if (timeout_ms == 0) {
+        DWORD queued = 0;
+        if (FT.GetQueueStatus(io->h, &queued) != FT_OK) return -1;
+        if (queued == 0) return 0;
+        if (queued > (DWORD)n) queued = (DWORD)n;
+        if (FT.Read(io->h, buf, queued, &got) != FT_OK) return -1;
+        return got <= queued ? (int)got : -1;
+    }
+    uint32_t deadline = mvci_now_ms() + (uint32_t)timeout_ms;
+    int configured = ft_set_timeout_until(io, deadline, 1);
+    if (configured <= 0) return configured;
     if (FT.Read(io->h, buf, (DWORD)n, &got) != FT_OK) return -1;
-    return (int)got;
+    return got <= (DWORD)n ? (int)got : -1;     /* got < n is a timeout */
 }
 
+int mvci_io_purge_rx_checked(mvci_io_t *io)
+{
+    if (!io) return -1;
+    io->purge_failed = (FT.Purge(io->h, FT_PURGE_RX) != FT_OK);
+    return io->purge_failed ? -1 : 0;
+}
 void mvci_io_purge_rx(mvci_io_t *io)
 {
-    FT.Purge(io->h, FT_PURGE_RX);
+    (void)mvci_io_purge_rx_checked(io);
 }
 
 /* ====================================================================== */
@@ -161,8 +245,9 @@ void mvci_io_purge_rx(mvci_io_t *io)
 #include <sys/ioctl.h>
 #include <termios.h>
 #include <unistd.h>
+#include <poll.h>
 
-struct mvci_io { int fd; };
+struct mvci_io { int fd; int purge_failed; };
 
 mvci_io_t *mvci_io_open(const char *port)
 {
@@ -171,30 +256,31 @@ mvci_io_t *mvci_io_open(const char *port)
 
     io->fd = open(port, O_RDWR | O_NOCTTY | O_NONBLOCK);
     if (io->fd < 0) { free(io); return NULL; }
-    fcntl(io->fd, F_SETFL, fcntl(io->fd, F_GETFL) & ~O_NONBLOCK);
 
     struct termios t;
     memset(&t, 0, sizeof t);
     cfmakeraw(&t);
     t.c_cflag = CS8 | CLOCAL | CREAD;
-    cfsetispeed(&t, B115200);
-    cfsetospeed(&t, B115200);
-    t.c_cc[VMIN] = 0;
+    if (cfsetispeed(&t, B115200) || cfsetospeed(&t, B115200)) goto fail;
+    t.c_cc[VMIN] = 1;
     t.c_cc[VTIME] = 0;
-    tcsetattr(io->fd, TCSANOW, &t);
-    tcflush(io->fd, TCIOFLUSH);
+    if (tcsetattr(io->fd, TCSANOW, &t) || tcflush(io->fd, TCIOFLUSH)) goto fail;
 
     /* DTR pulse = MCU reset (ClrRts, SetDtr, 15 ms, ClrDtr) */
     int s = 0;
-    ioctl(io->fd, TIOCMGET, &s);
-    s &= ~TIOCM_RTS; ioctl(io->fd, TIOCMSET, &s);
-    s |=  TIOCM_DTR; ioctl(io->fd, TIOCMSET, &s);
+    if (ioctl(io->fd, TIOCMGET, &s)) goto fail;
+    s &= ~TIOCM_RTS; if (ioctl(io->fd, TIOCMSET, &s)) goto fail;
+    s |=  TIOCM_DTR; if (ioctl(io->fd, TIOCMSET, &s)) goto fail;
     mvci_sleep_ms(15);
-    s &= ~TIOCM_DTR; ioctl(io->fd, TIOCMSET, &s);
+    s &= ~TIOCM_DTR; if (ioctl(io->fd, TIOCMSET, &s)) goto fail;
 
     mvci_sleep_ms(1000);                        /* MCU boot */
-    tcflush(io->fd, TCIOFLUSH);
+    if (tcflush(io->fd, TCIOFLUSH)) goto fail;
     return io;
+fail:
+    close(io->fd);
+    free(io);
+    return NULL;
 }
 
 void mvci_io_close(mvci_io_t *io)
@@ -204,34 +290,81 @@ void mvci_io_close(mvci_io_t *io)
     free(io);
 }
 
-int mvci_io_write(mvci_io_t *io, const uint8_t *buf, int n)
+static int wait_ready(mvci_io_t *io, short events, uint32_t deadline)
 {
+    for (;;) {
+        int remaining = (int32_t)(deadline - mvci_now_ms());
+        struct pollfd fd = { io->fd, events, 0 };
+        int r = poll(&fd, 1, remaining > 0 ? remaining : 0);
+        if (r < 0 && errno == EINTR) {
+            if ((int32_t)(deadline - mvci_now_ms()) <= 0) return 0;
+            continue;
+        }
+        if (r <= 0) return r;
+        if (fd.revents & (POLLERR | POLLHUP | POLLNVAL)) return -1;
+        if (fd.revents & events) return 1;
+        return -1;
+    }
+}
+
+int mvci_io_write_timeout(mvci_io_t *io, const uint8_t *buf, int n, int timeout_ms)
+{
+    if (!io || !buf || n < 0 || timeout_ms < 0 || io->purge_failed) return -1;
+    uint32_t deadline = mvci_now_ms() + (uint32_t)timeout_ms;
     int off = 0;
     while (off < n) {
+        int ready = wait_ready(io, POLLOUT, deadline);
+        if (ready < 0) return -1;
+        if (!ready || (timeout_ms && (int32_t)(deadline - mvci_now_ms()) <= 0)) break;
         int w = (int)write(io->fd, buf + off, (size_t)(n - off));
-        if (w < 0) { if (errno == EAGAIN) continue; return -1; }
+        if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
+            if ((int32_t)(deadline - mvci_now_ms()) <= 0) break;
+            continue;
+        }
+        if (w <= 0) return -1; /* zero progress must not spin */
         off += w;
+        if ((int32_t)(deadline - mvci_now_ms()) <= 0) break;
     }
-    tcdrain(io->fd);
+    /* Do not tcdrain: it has no deadline and is not a physical ACK. */
     return off;
+}
+
+int mvci_io_write(mvci_io_t *io, const uint8_t *buf, int n)
+{
+    int written = mvci_io_write_timeout(io, buf, n, 1000);
+    return written == n ? n : -1;
 }
 
 int mvci_io_read(mvci_io_t *io, uint8_t *buf, int n, int timeout_ms)
 {
-    int got = 0;
+    if (!io || !buf || n < 0 || timeout_ms < 0 || io->purge_failed) return -1;
     uint32_t deadline = mvci_now_ms() + (uint32_t)timeout_ms;
+    int got = 0;
     while (got < n) {
-        if ((int32_t)(deadline - mvci_now_ms()) <= 0) break;
+        int ready = wait_ready(io, POLLIN, deadline);
+        if (ready < 0) return -1;
+        if (!ready || (timeout_ms && (int32_t)(deadline - mvci_now_ms()) <= 0)) break;
         int r = (int)read(io->fd, buf + got, (size_t)(n - got));
-        if (r < 0 && errno != EAGAIN) return -1;
-        if (r > 0) got += r; else mvci_sleep_ms(1);
+        if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
+            if ((int32_t)(deadline - mvci_now_ms()) <= 0) break;
+            continue;
+        }
+        if (r <= 0) return -1; /* EOF or device loss, never an empty queue */
+        got += r;
+        if ((int32_t)(deadline - mvci_now_ms()) <= 0) break;
     }
     return got;
 }
 
+int mvci_io_purge_rx_checked(mvci_io_t *io)
+{
+    if (!io) return -1;
+    io->purge_failed = tcflush(io->fd, TCIFLUSH) != 0;
+    return io->purge_failed ? -1 : 0;
+}
 void mvci_io_purge_rx(mvci_io_t *io)
 {
-    tcflush(io->fd, TCIFLUSH);
+    (void)mvci_io_purge_rx_checked(io);
 }
 
 #endif

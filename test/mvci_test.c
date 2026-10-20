@@ -292,34 +292,34 @@ static void selftest(void)
          * public path from ever copying past it. */
         uint8_t in[MVCI_MAX_INNER], addr[MVCI_MAX_INNER];
         memset(addr, 0x41, sizeof addr);
-        int ok = (mvci_inner_five_baud_init(3, addr, MVCI_MAX_INNER - 8 + 1, in) < 0);
+        int ok = (mvci_inner_five_baud_init(3, addr, MVCI_MAX_INNER - 16 + 1, in) < 0);
         printf("[%s] five-baud oversized rejected\n", ok ? "PASS" : "FAIL");
         ok ? g_pass++ : g_fail++;
-        ok = (mvci_inner_five_baud_init(3, addr, MVCI_MAX_INNER - 8, in)
-              == (int)MVCI_MAX_INNER);
-        printf("[%s] five-baud max range accepted\n", ok ? "PASS" : "FAIL");
+        ok = (mvci_inner_five_baud_init(3, addr, MVCI_MAX_INNER - 16, in)
+              == MVCI_MAX_INNER - 8);
+        printf("[%s] five-baud wire maximum accepted\n", ok ? "PASS" : "FAIL");
         ok ? g_pass++ : g_fail++;
     }
     {
         uint8_t in[MVCI_MAX_INNER], init[MVCI_MAX_INNER];
         memset(init, 0x42, sizeof init);
-        int ok = (mvci_inner_fast_init(3, init, MVCI_MAX_INNER - 8 + 1, in) < 0);
+        int ok = (mvci_inner_fast_init(3, init, MVCI_MAX_INNER - 16 + 1, in) < 0);
         printf("[%s] fast_init oversized rejected\n", ok ? "PASS" : "FAIL");
         ok ? g_pass++ : g_fail++;
-        ok = (mvci_inner_fast_init(3, init, MVCI_MAX_INNER - 8, in)
-              == (int)MVCI_MAX_INNER);
-        printf("[%s] fast_init max range accepted\n", ok ? "PASS" : "FAIL");
+        ok = (mvci_inner_fast_init(3, init, MVCI_MAX_INNER - 16, in)
+              == MVCI_MAX_INNER - 8);
+        printf("[%s] fast_init wire maximum accepted\n", ok ? "PASS" : "FAIL");
         ok ? g_pass++ : g_fail++;
     }
     {
         uint8_t in[MVCI_MAX_INNER], msg[MVCI_MAX_INNER];
         memset(msg, 0x43, sizeof msg);
-        int ok = (mvci_inner_write_msg(3, msg, MVCI_MAX_INNER - 11 + 1, in) < 0);
+        int ok = (mvci_inner_write_msg(3, msg, MVCI_MAX_INNER - 19 + 1, in) < 0);
         printf("[%s] write_msg oversized rejected\n", ok ? "PASS" : "FAIL");
         ok ? g_pass++ : g_fail++;
-        ok = (mvci_inner_write_msg(3, msg, MVCI_MAX_INNER - 11, in)
-              == (int)MVCI_MAX_INNER);
-        printf("[%s] write_msg max range accepted\n", ok ? "PASS" : "FAIL");
+        ok = (mvci_inner_write_msg(3, msg, MVCI_MAX_INNER - 19, in)
+              == MVCI_MAX_INNER - 8);
+        printf("[%s] write_msg wire maximum accepted\n", ok ? "PASS" : "FAIL");
         ok ? g_pass++ : g_fail++;
     }
     {

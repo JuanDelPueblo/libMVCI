@@ -313,7 +313,7 @@ static void test_queued_diagnostic_reply(void)
         ok(set_one(ch, DATA_RATE, 10400) == STATUS_NOERROR,
            "previous empty poll status cannot replace the next config ACK");
         count = 1;
-        ok(PassThruReadMsgs(ch, &rx, &count, 10) == ERR_BUFFER_EMPTY && count == 0,
+        ok(PassThruReadMsgs(ch, &rx, &count, 10) == ERR_TIMEOUT && count == 0,
            "queued reply is delivered once");
 
         mock_async_reply(mode);
@@ -325,7 +325,7 @@ static void test_queued_diagnostic_reply(void)
            "explicit RX clear succeeds");
         ok(mock_frame_count() == before, "local RX clear sends no adapter command");
         count = 1;
-        ok(PassThruReadMsgs(ch, &rx, &count, 10) == ERR_BUFFER_EMPTY && count == 0,
+        ok(PassThruReadMsgs(ch, &rx, &count, 10) == ERR_TIMEOUT && count == 0,
            "explicit RX clear removes software and serial queued replies");
         ok(PassThruDisconnect(ch) == STATUS_NOERROR, "diagnostic test disconnect");
         ok(PassThruClose(dev) == STATUS_NOERROR, "diagnostic test close");
@@ -432,16 +432,19 @@ static void test_loopback_delivery(void)
     J2534_ULONG count = 2;
     ok(PassThruReadMsgs(ch, rx, &count, 20) == STATUS_NOERROR && count == 2
        && rx[0].RxStatus == 2 && rx[0].DataSize == 1 && rx[0].Data[0] == 0x48
+       && rx[0].ExtraDataIndex == 0
        && rx[1].RxStatus == 0 && rx[1].DataSize == sizeof reply
+       && rx[1].ExtraDataIndex == rx[1].DataSize && rx[1].Timestamp == 0
        && memcmp(rx[1].Data, reply, sizeof reply) == 0,
        "disabled loopback drops echo but preserves prefix and ECU frame");
     ok(set_one(ch, LOOPBACK, 1) == STATUS_NOERROR, "enable delivery of real device echoes");
     mock_rx_record(echo, sizeof echo, 2);
     count = 1;
     ok(PassThruReadMsgs(ch, rx, &count, 20) == STATUS_NOERROR && count == 1
-       && rx[0].RxStatus == 2 && rx[0].DataSize == sizeof echo
+       && rx[0].RxStatus == TX_MSG_TYPE && rx[0].DataSize == sizeof echo
+       && rx[0].ExtraDataIndex == rx[0].DataSize && rx[0].Timestamp == 0
        && memcmp(rx[0].Data, echo, sizeof echo) == 0,
-       "enabled loopback delivers the device bytes unchanged");
+       "enabled loopback keeps device bytes with standard echo metadata");
     ok(PassThruClose(dev) == STATUS_NOERROR, "loopback test close");
 }
 

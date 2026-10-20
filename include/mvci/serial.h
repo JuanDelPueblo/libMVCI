@@ -48,6 +48,13 @@
  * ====================================================================== */
 uint8_t mvci_xorsum(const uint8_t *p, size_t n);
 
+/* DES-ECB in place over nblocks 8-byte blocks. The checked calls return 0 on
+ * success and -1 on failure. A backend failure clears the whole buffer, so no
+ * plaintext is left; an argument error (NULL pointer, block count too large for
+ * the backend) leaves it untouched. The void calls do the same work and discard the result: prefer
+ * the checked calls. */
+int  mvci_des_encrypt_checked(const uint8_t key[8], uint8_t *buf, size_t nblocks);
+int  mvci_des_decrypt_checked(const uint8_t key[8], uint8_t *buf, size_t nblocks);
 void mvci_des_encrypt(const uint8_t key[8], uint8_t *buf, size_t nblocks);
 void mvci_des_decrypt(const uint8_t key[8], uint8_t *buf, size_t nblocks);
 
@@ -120,9 +127,9 @@ int mvci_set_prog_voltage(mvci_ctx_t *ctx, uint32_t pin, uint32_t voltage);
 int mvci_clear_periodic(mvci_ctx_t *ctx);
 /* Clear software and host serial RX queues only. No adapter command. */
 int mvci_clear_rx_buffer(mvci_ctx_t *ctx);
-/* Five-baud init. Returns key byte count (>=0), MVCI_FB_NOT_CONNECTED (-2)
- * for the evidenced OBD-disconnected status reply, or -1 for any other
- * failure. No success wire shape is proven, so any other reply fails closed. */
+/* Five-baud init. Returns the two key bytes from the exact evidenced Corolla
+ * success reply (currently 08 08), MVCI_FB_NOT_CONNECTED (-2) for the
+ * evidenced OBD-disconnected reply, or -1 for any other failure. */
 int mvci_five_baud_init(mvci_ctx_t *ctx, const uint8_t *addr, size_t naddr,
                         uint8_t *out, size_t cap);
 #define MVCI_FB_NOT_CONNECTED (-2)

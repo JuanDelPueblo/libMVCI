@@ -14,7 +14,9 @@ CMake is the single build system for every platform (Linux, macOS, Windows).
 ```
 include/mvci/   public headers      -> #include <mvci/j2534.h>, <mvci/serial.h>
 src/            sources + private headers (io.h, compat.h, mvci.def)
-test/           mvci_test.c (verification harness)
+test/           mvci_test.c (codec/live harness), mvci_seq_test.c (provider
+                sequence test), mvci_lifecycle_test.c (public lifecycle
+                interleavings), mock_io.c (scripted transport)
 cmake/          libmvciConfig.cmake.in (package config template)
 CMakeLists.txt  cross-platform build
 CMakePresets.json  win32/win64 + default build presets
@@ -33,7 +35,7 @@ external crypto dependency there.
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
-ctest --test-dir build            # runs the hardware-free codec self-test
+ctest --test-dir build            # offline regressions from test/offline-tests.txt
 ```
 
 Outputs land in `build/` (multi-config generators like Visual Studio put them in
@@ -121,6 +123,89 @@ add_custom_command(TARGET my_app POST_BUILD
 
 ---
 
+## Verification without hardware
+
+Offline targets need no adapter, provider, or vehicle. Each test builds from the
+repository source and runs against captured vectors or a scripted transport.
+Build each configuration in its own directory so artifacts cannot mix. The
+commands below write under `build/`, which git ignores.
+
+On Linux with Bash 4.3 or later, use the maintained check command:
+
+```sh
+tools/check-offline.sh --out-dir build/check-offline
+```
+
+It builds the native library, checks the fixed-width ABI and J2534 exports,
+and runs the supported offline regressions. It also attempts available MinGW
+cross-builds and sanitizers. Missing prerequisites are reported with reasons.
+A build or test failure is a failure, not a skip. Nothing is installed.
+
+The focused suites cover captured codec vectors, provider command sequences,
+init output refusals, thread-local diagnostics, filters and clear operations,
+read/write counts and deadlines, framing and overflow, backend failures, and
+public lifecycle interleavings such as guards, read cancellation, handle reuse
+and Connect admission. Platform fakes test status handling without loading the
+proprietary runtime. Paced and deadline tests use a test clock on the supported
+host. `test/offline-tests.txt` is the manifest; it lists the target set and its
+host limits, and the build and direct paths read it rather than a fixed count.
+
+CMake can also run the native checks. It reports tests that need unavailable
+host features, such as GNU linker wraps or host OpenSSL fakes:
+
+```sh
+cmake -S . -B build/offline -DCMAKE_BUILD_TYPE=Debug
+cmake --build build/offline
+ctest --test-dir build/offline --output-on-failure
+```
+
+If CMake is unavailable, use the direct compiler path:
+
+```sh
+tools/check-offline.sh --no-cmake --out-dir build/check-direct
+```
+
+The no-argument `mvci_test` run is the codec self-test. Its port argument starts
+the live harness. Do not pass a port in an offline run or substitute an installed
+provider for the repository source.
+
+### Windows compile and export check
+
+A cross-compiler can verify that the Windows source set builds and exports the
+undecorated `PassThru*` names without a Windows machine:
+
+```sh
+mkdir -p build/cross-win32
+i686-w64-mingw32-gcc -std=gnu11 -O2 -Wall -Wextra -DMVCI_BUILDING_DLL \
+    -Iinclude -Isrc -shared \
+    src/passthru.c src/serial.c src/io.c src/des.c src/mvci.def \
+    -lbcrypt -o build/cross-win32/MVCI32.dll
+i686-w64-mingw32-objdump -p build/cross-win32/MVCI32.dll
+```
+
+This is a compile and export inspection, not a Windows runtime test. It does
+not exercise CNG, D2XX, or a J2534 host. MinGW may print stdcall-alias warnings
+for the exports; confirm the names in the `objdump` output.
+
+### What offline verification does not cover
+
+- Physical voltage, K-line waveforms, and measured timing.
+- Adapter compatibility beyond the fixed-width ABI and export names.
+- Windows or macOS runtime behavior of the crypto and transport backends.
+- Exclusive port ownership on POSIX, or reconnection of a physical cable. A
+  scripted close and reopen is not proof that the adapter reconnects.
+- J2534 host acceptance, ECU communication, and programming.
+
+### Reporting results
+
+Record each target as pass, fail, or not run. If CMake, a platform compiler, a
+Windows/macOS runtime, or the sanitizer runtime is absent, report the target as
+not run and name the missing tool. Do not count a skipped target as a pass. A
+failed `-fsanitize=address,undefined` link because the runtime library is
+missing is a skip, not a sanitizer result.
+
+---
+
 ## Per-platform notes
 
 All three platforms build with the CMake steps above; what differs is the
@@ -163,17 +248,30 @@ opens the adapter by its USB description `"M-VCI"`. Live test:
 
 ## Notes
 
-- The library models one ISO14230 channel per opened device (the adapter's
+- The library models one ISO9141 or ISO14230 channel per opened device (the adapter's
   single K-line). `PassThruOpen` runs the handshake and sends no background
-  traffic; `PassThruClose` tears the session down. A keepalive helper exists
+  traffic; `PassThruClose` tears the session down. A second Connect on a
+  connected device returns `ERR_CHANNEL_IN_USE` without waiting. Device and
+  channel handles are unique and never reused. A lost or ambiguous result
+  requires Close/Open; see
+  [session lifecycle](docs/PROTOCOL.md#8-teardown-and-session-lifecycle).
+  A keepalive helper exists
   for explicit use, but the provider path never starts it (T254/T255 prove
   the adapter tolerates multi-second idle with zero keepalive traffic).
-- `PassThruReadMsgs` returns the device RxStatus byte unchanged (`0` = received
-  data, `2` = TX echo), matching the original DLL's behaviour.
-- Wired IOCTLs: `SET_CONFIG` (uses the connected protocol id), `FIVE_BAUD_INIT`
-  (adapter-only; disconnected maps to `ERR_DEVICE_NOT_CONNECTED`), `FAST_INIT`
-  (disconnected status maps to `ERR_TIMEOUT`), `CLEAR_PERIODIC_MSGS`, and the
-  buffer/filter clears (no-ops). Others return `ERR_NOT_SUPPORTED`.
+- `PassThruReadMsgs` maps device TX echoes to `TX_MSG_TYPE` and sets
+  `ExtraDataIndex=DataSize` for complete records. It preserves the observed
+  one-byte `48`/status `02` receive indication with `ExtraDataIndex=0`.
+  Adapter timestamps remain unknown; `Timestamp` stays zero.
+- Wired IOCTLs include truthful `GET_CONFIG(LOOPBACK)`, `SET_CONFIG`,
+  `FIVE_BAUD_INIT`, `FAST_INIT`, `CLEAR_PERIODIC_MSGS`, `CLEAR_RX_BUFFER`,
+  and `CLEAR_MSG_FILTERS`. Only a connected channel can use channel IOCTLs.
+  Voltage-read IOCTLs validate device scope and return `ERR_NOT_SUPPORTED`.
+  TX clear is unsupported because no cable cancellation command is evidenced.
+  See [filter and clear contracts](docs/filter-and-clear-contracts.md).
+- Checked DES calls report CNG and CommonCrypto failures and clear failed
+  output. Frame encoding and decoding stop on a crypto failure. The existing
+  void DES wrappers remain available but discard the result; new callers
+  should use the checked calls. Native fake-backend tests cover this host logic.
 - `PassThruSetProgrammingVoltage` supports only Pin 15 `SHORT_TO_GROUND`
   (`0xFFFFFFFE`). All other pin/value pairs return `ERR_NOT_SUPPORTED`. No
   positive voltage exists.

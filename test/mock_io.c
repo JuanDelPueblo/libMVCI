@@ -39,10 +39,23 @@ static int g_async_reply;
 static uint32_t g_protocol;
 static int g_poll_reply, g_device_reply_pending;
 static uint8_t g_config_status;
+static int g_five_baud_success;
+static int g_fast_reply_len;
+static int g_fast_reply_enabled;
+static int g_handshake_shape;
+static int g_purge_failure;
+void mock_purge_failure(int enabled) { g_purge_failure = enabled; }
+void mock_handshake_shape(int mode) { g_handshake_shape = mode; }
 
 void mock_async_reply(int mode) { g_async_reply = mode; }
 void mock_poll_reply(void) { g_poll_reply = 1; }
 void mock_config_status(uint8_t status) { g_config_status = status; }
+void mock_five_baud_success(int enabled) { g_five_baud_success = enabled; }
+void mock_fast_reply_length(int length)
+{
+    g_fast_reply_len = length;
+    g_fast_reply_enabled = length >= 0 && length <= MVCI_MAX_INNER - 3;
+}
 
 const uint8_t *mock_key(void) { return MOCK_KEY; }
 
@@ -149,10 +162,27 @@ static void answer(const uint8_t *inner, int ilen)
         static const uint8_t r[8] = { 0x02, 0x00, 0x0c, 0x00, 0x00, 0x00, 0x00, 0xb8 };
         memcpy(st, r, 8);
     } else if (ilen >= 4 && inner[2] == 0x0e && inner[3] == 0x04) {
-        /* Exact T254 OBD-disconnected five-baud reply. */
-        static const uint8_t r[8] = { 0x02, 0x00, 0x0e, 0x08, 0x00, 0x00, 0x00, 0x28 };
-        memcpy(st, r, 8);
+        if (g_five_baud_success) {
+            static const uint8_t r[8] = { 0x03, 0x00, 0x0e, 0x08, 0x08, 0x00, 0x00, 0x00 };
+            memcpy(st, r, 8);
+            g_five_baud_success = 0;
+        } else {
+            static const uint8_t r[8] = { 0x02, 0x00, 0x0e, 0x08, 0x00, 0x00, 0x00, 0x28 };
+            memcpy(st, r, 8);
+        }
     } else if (ilen >= 4 && inner[2] == 0x0e && inner[3] == 0x05) {
+        if (g_fast_reply_enabled) {
+            uint8_t r[MVCI_MAX_INNER] = {0};
+            size_t n = (size_t)g_fast_reply_len + 3;
+            r[0] = (uint8_t)(g_fast_reply_len + 1); r[2] = 0x0e;
+            for (int i = 0; i < g_fast_reply_len; i++) r[3 + i] = (uint8_t)(0x80 + i);
+            uint8_t frame[MVCI_MAX_FRAME];
+            int fn = mvci_frame_enc(MOCK_KEY, r, n, frame, sizeof frame);
+            if (fn > 0) queue_bytes(frame, fn);
+            g_fast_reply_len = 0;
+            g_fast_reply_enabled = 0;
+            return;
+        }
         /* Exact T255 OBD-disconnected fast-init reply. */
         static const uint8_t r[8] = { 0x02, 0x00, 0x0e, 0x08, 0x00, 0x00, 0x00, 0xf0 };
         memcpy(st, r, 8);
@@ -185,11 +215,18 @@ static void on_frame(const uint8_t *f, int n)
     if (n == 3 && f[0] == 0x03) return;   /* reset: no reply */
     if (n == 12 && f[2] == 0x07 && f[3] == 0x00 && f[4] == 0x01) {
         /* identify: issue the fixed challenge */
-        uint8_t pl[11] = { 0x09, 0x00, 0x01,
+        uint8_t pl[12] = { 0x09, 0x00, 0x01,
                             MOCK_KEY[0], MOCK_KEY[1], MOCK_KEY[2], MOCK_KEY[3],
                             MOCK_KEY[4], MOCK_KEY[5], MOCK_KEY[6], MOCK_KEY[7] };
         uint8_t frame[MVCI_MAX_FRAME];
-        int m = mvci_frame_plain(pl, sizeof pl, frame, sizeof frame);
+        size_t plen = 11;
+        if (g_handshake_shape == 1) pl[1] = 0x7f;
+        if (g_handshake_shape == 2) pl[2] = 0x7f;
+        if (g_handshake_shape == 3) plen = 10;
+        if (g_handshake_shape == 4) plen = 12;
+        if (g_handshake_shape == 5) pl[0] = 8;
+        g_handshake_shape = 0;
+        int m = mvci_frame_plain(pl, plen, frame, sizeof frame);
         if (m > 0) queue_bytes(frame, m);
         return;
     }
@@ -208,11 +245,15 @@ static void on_frame(const uint8_t *f, int n)
 mvci_io_t *mvci_io_open(const char *port)
 {
     (void)port;
+    g_purge_failure = 0;
     g_nwritten = 0;
     g_asmlen = 0;
     g_qhead = g_qtail = 0;
     g_async_reply = 0;
     g_config_status = 0;
+    g_five_baud_success = 0;
+    g_fast_reply_len = 0;
+    g_fast_reply_enabled = 0;
     g_protocol = 0;
     g_poll_reply = g_device_reply_pending = 0;
     return &g_io;
@@ -256,4 +297,18 @@ void mvci_io_purge_rx(mvci_io_t *io)
 {
     (void)io;
     g_qhead = g_qtail = 0;
+}
+
+/* Deadline transport entry point used by the real session pipeline. */
+int mvci_io_write_timeout(mvci_io_t *io, const uint8_t *buf, int n, int timeout_ms)
+{
+    (void)timeout_ms;
+    return mvci_io_write(io, buf, n);
+}
+
+int mvci_io_purge_rx_checked(mvci_io_t *io)
+{
+    if (g_purge_failure) return -1;
+    mvci_io_purge_rx(io);
+    return 0;
 }

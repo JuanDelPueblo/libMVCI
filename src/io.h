@@ -21,10 +21,21 @@ void       mvci_io_close(mvci_io_t *io);
 /* write all n bytes; returns n on success, -1 on error */
 int  mvci_io_write(mvci_io_t *io, const uint8_t *buf, int n);
 
-/* read up to n bytes within timeout_ms; returns bytes read (may be < n) or -1 */
+/* Deadline-aware write: returns bytes accepted (possibly partial), or -1.
+ * timeout_ms=0 never waits. Acceptance is host I/O, not physical transmission.
+ * POSIX offers the bytes once without waiting. Windows (D2XX has no documented
+ * nonblocking write) accepts none and returns 0. A status failure returns -1
+ * even if some bytes were accepted; callers treat that write as ambiguous. */
+int mvci_io_write_timeout(mvci_io_t *io, const uint8_t *buf, int n, int timeout_ms);
+
+/* read up to n bytes within timeout_ms; returns bytes read (may be < n) or -1.
+ * timeout_ms=0 returns only bytes already queued and never waits; < 0 is -1. */
 int  mvci_io_read(mvci_io_t *io, uint8_t *buf, int n, int timeout_ms);
 
-/* discard any buffered input */
+/* Host input purge only; never a cable mailbox or ACK recovery boundary.
+ * The checked call returns 0/-1. A failed purge blocks transport I/O until
+ * a later successful purge. The void form is retained for existing callers. */
+int mvci_io_purge_rx_checked(mvci_io_t *io);
 void mvci_io_purge_rx(mvci_io_t *io);
 
 #endif /* MVCI_IO_H */
