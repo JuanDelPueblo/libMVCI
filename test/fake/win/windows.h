@@ -20,6 +20,7 @@ typedef uint8_t   UCHAR, *PUCHAR;
 typedef wchar_t   WCHAR;
 typedef int32_t   NTSTATUS;
 typedef int       CRITICAL_SECTION;
+typedef int       CONDITION_VARIABLE;
 typedef unsigned long (*LPTHREAD_START_ROUTINE)(void *);
 typedef void *LPSECURITY_ATTRIBUTES;
 typedef size_t SIZE_T;
@@ -44,6 +45,13 @@ static inline void InitializeCriticalSection(CRITICAL_SECTION *c) { (void)c; }
 static inline void EnterCriticalSection(CRITICAL_SECTION *c)      { (void)c; }
 static inline void LeaveCriticalSection(CRITICAL_SECTION *c)      { (void)c; }
 static inline void DeleteCriticalSection(CRITICAL_SECTION *c)     { (void)c; }
+
+/* Declared only so unused compat wrappers compile. These single-threaded
+ * backend fakes do not implement or exercise Windows condition variables. A
+ * test that calls one must supply its model, or fail to link. */
+void InitializeConditionVariable(CONDITION_VARIABLE *c);
+int SleepConditionVariableCS(CONDITION_VARIABLE *c, CRITICAL_SECTION *m, DWORD ms);
+void WakeAllConditionVariable(CONDITION_VARIABLE *c);
 
 static inline PVOID InterlockedCompareExchangePointer(PVOID volatile *dst, PVOID xchg, PVOID cmp)
 { return __sync_val_compare_and_swap(dst, cmp, xchg); }
