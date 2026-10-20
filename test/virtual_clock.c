@@ -4,8 +4,8 @@
  * second and advances by exactly the requested sleep. A test therefore keeps
  * the pacing logic under test without waiting in real time.
  *
- * This file is not part of the driver library. It would report physical
- * timing if it were used for anything else.
+ * This file is not part of the driver library. Never use it to report physical
+ * timing.
  */
 #include <stdint.h>
 #include <time.h>

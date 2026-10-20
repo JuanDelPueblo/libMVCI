@@ -36,6 +36,11 @@
 
 set -uo pipefail
 
+if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 3) )); then
+    printf 'error: this checker needs Bash 4.3 or later; use CMake directly on this host\n' >&2
+    exit 2
+fi
+
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 out_dir="$repo/build/check-offline"
 cc="${CC:-cc}"
@@ -85,8 +90,12 @@ abs_path() {
     fi
 }
 
-repo_abs=$(abs_path "$repo")
-out_abs=$(abs_path "$out_dir")
+if ! repo_abs=$(abs_path "$repo") || [[ -z $repo_abs ]]; then
+    usage_error "cannot resolve the repository path; use CMake directly on this host"
+fi
+if ! out_abs=$(abs_path "$out_dir") || [[ -z $out_abs ]]; then
+    usage_error "cannot resolve the output path; no output was cleaned"
+fi
 
 if [[ $out_abs == / ]]; then
     usage_error "refusing to use the filesystem root as the output directory"

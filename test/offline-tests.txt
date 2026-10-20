@@ -18,7 +18,7 @@
 #
 # note is a short statement of what the test proves; for a limited host it
 # names the missing capability. Every test runs with no arguments and needs no
-# adapter, provider, vehicle, network or installed crypto runtime.
+# adapter, provider, vehicle, network or proprietary runtime.
 #
 # To register another offline regression, add its source file and one line
 # here. CMake does not glob the test directory: a missing source is a
@@ -32,6 +32,6 @@ mvci_filter_contract_test|mvci_filter_contract_test|test/mvci_filter_contract_te
 mvci_pipeline_test|mvci_pipeline_test|test/mvci_pipeline_test.c src/passthru.c src/serial.c src/des.c|-|-|clock_gettime nanosleep pthread_mutex_trylock|gnu|synchronous pipeline, includes its own transport
 mvci_posix_io_test|mvci_posix_io_test|test/mvci_posix_io_test.c|-|-|open close tcsetattr tcflush ioctl poll read write clock_gettime nanosleep|gnu|POSIX transport syscalls are scripted
 mvci_codec_bounds_test|mvci_codec_bounds_test|test/mvci_codec_bounds_test.c src/serial.c src/io.c src/des.c|-|-|-|any|codec pointer, length and wire bounds
-des_cng_fault_test|des_cng_fault_test|test/des_backend_fault_test.c src/serial.c test/mock_io.c|MVCI_DES_USE_CNG|test/fake/win|-|posix|fake CNG backend, Windows uses the real backend
-des_commoncrypto_fault_test|des_commoncrypto_fault_test|test/des_backend_fault_test.c src/serial.c test/mock_io.c|MVCI_DES_USE_COMMONCRYPTO|test/fake/cc|-|posix|fake CommonCrypto backend, macOS uses the real backend
+des_cng_fault_test|des_cng_fault_test|test/des_backend_fault_test.c src/serial.c test/mock_io.c|MVCI_DES_USE_CNG|test/fake/win|-|gnu|fake CNG backend needs host OpenSSL
+des_commoncrypto_fault_test|des_commoncrypto_fault_test|test/des_backend_fault_test.c src/serial.c test/mock_io.c|MVCI_DES_USE_COMMONCRYPTO|test/fake/cc|-|gnu|fake CommonCrypto backend needs host OpenSSL
 win_io_fault_test|win_io_fault_test|test/win_io_fault_test.c|_WIN32|test/fake/win|-|posix|fake D2XX module and Windows headers

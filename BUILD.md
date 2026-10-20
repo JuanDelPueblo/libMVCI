@@ -129,7 +129,7 @@ repository source and runs against captured vectors or a scripted transport.
 Build each configuration in its own directory so artifacts cannot mix. The
 commands below write under `build/`, which git ignores.
 
-Use the maintained check command:
+On Linux with Bash 4.3 or later, use the maintained check command:
 
 ```sh
 tools/check-offline.sh --out-dir build/check-offline
@@ -146,7 +146,8 @@ read/write counts and deadlines, framing and overflow, and backend failures.
 Platform fakes test status handling without loading the proprietary runtime.
 Paced and deadline tests use a test clock on the supported host.
 
-CMake can also run the native checks:
+CMake can also run the native checks. It reports tests that need unavailable
+host features, such as GNU linker wraps or host OpenSSL fakes:
 
 ```sh
 cmake -S . -B build/offline -DCMAKE_BUILD_TYPE=Debug
