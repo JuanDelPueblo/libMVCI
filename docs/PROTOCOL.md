@@ -191,6 +191,31 @@ A typical request/response exchange (read poll loop) returns, in order: zero or
 more "no data" replies, one echo (`RxStatus = 02`), then the ECU data
 (`RxStatus = 00`).
 
+### Configuration read-back
+
+`GET_CONFIG` uses the caller's input `SCONFIG_LIST`, as required by J2534.
+The provider validates the whole list before it writes any output values.
+An empty list succeeds. A disconnected channel or a null parameter array for
+a nonempty list is refused. The call sends no cable command.
+
+Only `LOOPBACK` is reportable. It is a host delivery policy: `0` suppresses
+device transmit echoes; `1` forwards them unchanged. The driver never creates
+an echo from a requested write. A new channel starts at `1`, which preserves
+the earlier provider behavior. `SET_CONFIG(LOOPBACK)` accepts only `0` and `1`
+and sends no cable command. The one-byte `48` receive prefix with status `02`
+is preserved in either mode; it is not a transmit echo.
+
+No cable read-configuration command is evidenced. `GET_CONFIG` therefore
+returns `ERR_NOT_SUPPORTED` for every other parameter, including `DATA_RATE`,
+`P1_MAX`, `P3_MIN` and `P4_MIN`. The error text identifies the parameter.
+This remains true after a `SET_CONFIG` success ACK. The provider does not
+cache requested values and label them as applied values. A nonzero cable
+status on `SET_CONFIG` returns `ERR_FAILED`.
+
+Offline tests prove these API and delivery rules. They do not show whether
+the cable firmware applies K-line timing. A measured cable result or an
+evidenced read command is required before adding timing read-back support.
+
 ### Receive queue handling
 
 Do not flush the serial receive buffer before each transaction. A complete

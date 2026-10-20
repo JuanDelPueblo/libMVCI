@@ -473,7 +473,9 @@ int mvci_set_config(mvci_ctx_t *ctx, uint32_t param, uint32_t value)
     uint8_t in[16], resp[64];
     mvci_inner_set_config(ctx->proto, param, value, in);
     int r = mvci_transact(ctx, in, sizeof in, resp, sizeof resp, 2000);
-    return (r >= 3 && resp[0] == 0x02 && resp[2] == 0x0e) ? 0 : -1;
+    /* A nonzero cable status is a failure, not an applied setting. Even a
+     * success ACK proves command acceptance only, not electrical timing. */
+    return (r >= 4 && resp[0] == 0x02 && resp[2] == 0x0e && resp[3] == 0) ? 0 : -1;
 }
 
 int mvci_set_prog_voltage(mvci_ctx_t *ctx, uint32_t pin, uint32_t voltage)
