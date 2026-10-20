@@ -179,6 +179,7 @@ void mvci_io_purge_rx(mvci_io_t *io)
 #include <sys/ioctl.h>
 #include <termios.h>
 #include <unistd.h>
+#include <poll.h>
 
 struct mvci_io { int fd; };
 
@@ -189,30 +190,31 @@ mvci_io_t *mvci_io_open(const char *port)
 
     io->fd = open(port, O_RDWR | O_NOCTTY | O_NONBLOCK);
     if (io->fd < 0) { free(io); return NULL; }
-    fcntl(io->fd, F_SETFL, fcntl(io->fd, F_GETFL) & ~O_NONBLOCK);
 
     struct termios t;
     memset(&t, 0, sizeof t);
     cfmakeraw(&t);
     t.c_cflag = CS8 | CLOCAL | CREAD;
-    cfsetispeed(&t, B115200);
-    cfsetospeed(&t, B115200);
-    t.c_cc[VMIN] = 0;
+    if (cfsetispeed(&t, B115200) || cfsetospeed(&t, B115200)) goto fail;
+    t.c_cc[VMIN] = 1;
     t.c_cc[VTIME] = 0;
-    tcsetattr(io->fd, TCSANOW, &t);
-    tcflush(io->fd, TCIOFLUSH);
+    if (tcsetattr(io->fd, TCSANOW, &t) || tcflush(io->fd, TCIOFLUSH)) goto fail;
 
     /* DTR pulse = MCU reset (ClrRts, SetDtr, 15 ms, ClrDtr) */
     int s = 0;
-    ioctl(io->fd, TIOCMGET, &s);
-    s &= ~TIOCM_RTS; ioctl(io->fd, TIOCMSET, &s);
-    s |=  TIOCM_DTR; ioctl(io->fd, TIOCMSET, &s);
+    if (ioctl(io->fd, TIOCMGET, &s)) goto fail;
+    s &= ~TIOCM_RTS; if (ioctl(io->fd, TIOCMSET, &s)) goto fail;
+    s |=  TIOCM_DTR; if (ioctl(io->fd, TIOCMSET, &s)) goto fail;
     mvci_sleep_ms(15);
-    s &= ~TIOCM_DTR; ioctl(io->fd, TIOCMSET, &s);
+    s &= ~TIOCM_DTR; if (ioctl(io->fd, TIOCMSET, &s)) goto fail;
 
     mvci_sleep_ms(1000);                        /* MCU boot */
-    tcflush(io->fd, TCIOFLUSH);
+    if (tcflush(io->fd, TCIOFLUSH)) goto fail;
     return io;
+fail:
+    close(io->fd);
+    free(io);
+    return NULL;
 }
 
 void mvci_io_close(mvci_io_t *io)
@@ -222,27 +224,68 @@ void mvci_io_close(mvci_io_t *io)
     free(io);
 }
 
-int mvci_io_write(mvci_io_t *io, const uint8_t *buf, int n)
+static int wait_ready(mvci_io_t *io, short events, uint32_t deadline)
 {
+    for (;;) {
+        int remaining = (int32_t)(deadline - mvci_now_ms());
+        struct pollfd fd = { io->fd, events, 0 };
+        int r = poll(&fd, 1, remaining > 0 ? remaining : 0);
+        if (r < 0 && errno == EINTR) {
+            if ((int32_t)(deadline - mvci_now_ms()) <= 0) return 0;
+            continue;
+        }
+        if (r <= 0) return r;
+        if (fd.revents & (POLLERR | POLLHUP | POLLNVAL)) return -1;
+        if (fd.revents & events) return 1;
+        return -1;
+    }
+}
+
+int mvci_io_write_timeout(mvci_io_t *io, const uint8_t *buf, int n, int timeout_ms)
+{
+    if (!io || !buf || n < 0 || timeout_ms < 0) return -1;
+    uint32_t deadline = mvci_now_ms() + (uint32_t)timeout_ms;
     int off = 0;
     while (off < n) {
+        int ready = wait_ready(io, POLLOUT, deadline);
+        if (ready < 0) return -1;
+        if (!ready || (timeout_ms && (int32_t)(deadline - mvci_now_ms()) <= 0)) break;
         int w = (int)write(io->fd, buf + off, (size_t)(n - off));
-        if (w < 0) { if (errno == EAGAIN) continue; return -1; }
+        if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
+            if ((int32_t)(deadline - mvci_now_ms()) <= 0) break;
+            continue;
+        }
+        if (w <= 0) return -1; /* zero progress must not spin */
         off += w;
+        if ((int32_t)(deadline - mvci_now_ms()) <= 0) break;
     }
-    tcdrain(io->fd);
+    /* Do not tcdrain: it has no deadline and is not a physical ACK. */
     return off;
+}
+
+int mvci_io_write(mvci_io_t *io, const uint8_t *buf, int n)
+{
+    int written = mvci_io_write_timeout(io, buf, n, 1000);
+    return written == n ? n : -1;
 }
 
 int mvci_io_read(mvci_io_t *io, uint8_t *buf, int n, int timeout_ms)
 {
-    int got = 0;
+    if (!io || !buf || n < 0 || timeout_ms < 0) return -1;
     uint32_t deadline = mvci_now_ms() + (uint32_t)timeout_ms;
+    int got = 0;
     while (got < n) {
-        if ((int32_t)(deadline - mvci_now_ms()) <= 0) break;
+        int ready = wait_ready(io, POLLIN, deadline);
+        if (ready < 0) return -1;
+        if (!ready || (timeout_ms && (int32_t)(deadline - mvci_now_ms()) <= 0)) break;
         int r = (int)read(io->fd, buf + got, (size_t)(n - got));
-        if (r < 0 && errno != EAGAIN) return -1;
-        if (r > 0) got += r; else mvci_sleep_ms(1);
+        if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
+            if ((int32_t)(deadline - mvci_now_ms()) <= 0) break;
+            continue;
+        }
+        if (r <= 0) return -1; /* EOF or device loss, never an empty queue */
+        got += r;
+        if ((int32_t)(deadline - mvci_now_ms()) <= 0) break;
     }
     return got;
 }

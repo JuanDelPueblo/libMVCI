@@ -18,6 +18,8 @@
 #include <mvci/j2534.h>
 #include <mvci/serial.h>
 #include "compat.h"
+#include "pipeline.h"
+#include <limits.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -268,21 +270,47 @@ J2534_LONG J2534_API PassThruStopMsgFilter(J2534_ULONG ChannelID, J2534_ULONG Fi
     return STATUS_NOERROR;
 }
 
+/* Pipeline errors remain distinct from a valid empty poll. Counts describe
+ * completed adapter ACKs/delivered records, never ECU acceptance. */
+static J2534_LONG pipeline_error(int r)
+{
+    if (r == MVCI_PIPE_TIMEOUT) { set_err("deadline expired; command result may be unknown"); return ERR_TIMEOUT; }
+    if (r == MVCI_PIPE_IO) { set_err("transport lost or I/O failed; close and reopen"); return ERR_DEVICE_NOT_CONNECTED; }
+    if (r == MVCI_PIPE_OVERFLOW) { set_err("receive data lost: bounded queue or record overflow"); return ERR_BUFFER_OVERFLOW; }
+    if (r == MVCI_PIPE_REJECTED) { set_err("adapter rejected command or returned unknown status"); return ERR_FAILED; }
+    set_err("invalid frame or ambiguous reply; close and reopen");
+    return ERR_FAILED;
+}
+
 J2534_LONG J2534_API PassThruWriteMsgs(J2534_ULONG ChannelID, PASSTHRU_MSG *pMsg,
-                                 J2534_ULONG *pNumMsgs, J2534_ULONG TimeInterval)
+                                 J2534_ULONG *pNumMsgs, J2534_ULONG Timeout)
 {
     ensure_init();
-    (void)TimeInterval;
+    uint32_t deadline = mvci_now_ms() + Timeout;
+    if (!pNumMsgs) { set_err("NULL pNumMsgs"); return ERR_NULL_PARAMETER; }
+    J2534_ULONG want = *pNumMsgs;
+    *pNumMsgs = 0;
     slot_t *s = ch_slot(ChannelID);
     if (!s || !s->connected) { set_err("invalid channel id"); return ERR_INVALID_CHANNEL_ID; }
-    if (!pMsg || !pNumMsgs || *pNumMsgs == 0) { set_err("NULL/empty msg"); return ERR_NULL_PARAMETER; }
-    if (pMsg->DataSize == 0 || pMsg->DataSize > 64) { set_err("bad DataSize"); return ERR_INVALID_MSG; }
-
-    if (mvci_write_msg(s->ctx, pMsg->Data, pMsg->DataSize) != 0) {
-        set_err("write failed");
-        return ERR_FAILED;
+    if (!pMsg || !want) { set_err("NULL/empty msg"); return ERR_NULL_PARAMETER; }
+    if (Timeout > INT_MAX) { set_err("timeout exceeds supported monotonic interval"); return ERR_INVALID_TIME_INTERVAL; }
+    /* Validate the entire batch before any side effect. Unproven flags are
+     * refused instead of silently being encoded as zero. */
+    for (J2534_ULONG i = 0; i < want; i++) {
+        if (!pMsg[i].DataSize || pMsg[i].DataSize > MVCI_PIPE_MAX_DATA) { set_err("bad DataSize"); return ERR_INVALID_MSG; }
+        if (pMsg[i].ProtocolID != s->proto) { set_err("message protocol differs from channel"); return ERR_MSG_PROTOCOL_ID; }
+        if (pMsg[i].TxFlags) { set_err("transmit flags not supported"); return ERR_INVALID_FLAGS; }
     }
-    *pNumMsgs = 1;
+    /* There is no asynchronous TX worker/queue. Do not claim queued success
+     * or send an untracked command when the caller asks for queue-only mode. */
+    if (!Timeout) { set_err("zero-timeout queued writes not supported"); return ERR_NOT_SUPPORTED; }
+    for (J2534_ULONG i = 0; i < want; i++) {
+        int remaining = (int32_t)(deadline - mvci_now_ms());
+        if (remaining <= 0) return pipeline_error(MVCI_PIPE_TIMEOUT);
+        int r = mvci_write_msg_timeout(s->ctx, pMsg[i].Data, pMsg[i].DataSize, remaining);
+        if (r < 0) return pipeline_error(r);
+        ++*pNumMsgs;
+    }
     return STATUS_NOERROR;
 }
 
@@ -290,38 +318,42 @@ J2534_LONG J2534_API PassThruReadMsgs(J2534_ULONG ChannelID, PASSTHRU_MSG *pMsg,
                                 J2534_ULONG *pNumMsgs, J2534_ULONG Timeout)
 {
     ensure_init();
+    uint32_t deadline = mvci_now_ms() + Timeout;
+    if (!pNumMsgs) { set_err("NULL pNumMsgs"); return ERR_NULL_PARAMETER; }
+    J2534_ULONG want = *pNumMsgs;
+    *pNumMsgs = 0;
     slot_t *s = ch_slot(ChannelID);
     if (!s || !s->connected) { set_err("invalid channel id"); return ERR_INVALID_CHANNEL_ID; }
-    if (!pMsg || !pNumMsgs || *pNumMsgs == 0) { set_err("NULL/empty msg"); return ERR_NULL_PARAMETER; }
-
-    J2534_ULONG want = *pNumMsgs, got = 0;
-    uint32_t deadline = mvci_now_ms() + (uint32_t)(Timeout ? Timeout : 1);
-
-    while (got < want) {
-        uint8_t buf[64], rx = 0;
-        int m = mvci_poll(s->ctx, buf, sizeof buf, &rx, 200);
-        if (m > 0) {
-            /* Device status 2 is an echo, except the captured one-byte 48
-             * START_OF_MESSAGE prefix. Never suppress that receive marker. */
-            if (!s->loopback && rx == 2 && !(m == 1 && buf[0] == 0x48)) {
-                if ((int32_t)(deadline - mvci_now_ms()) <= 0) break;
-                continue;
-            }
-            PASSTHRU_MSG *o = &pMsg[got];
+    if (!pMsg || !want) { set_err("NULL/empty msg"); return ERR_NULL_PARAMETER; }
+    if (Timeout > INT_MAX) { set_err("timeout exceeds supported monotonic interval"); return ERR_INVALID_TIME_INTERVAL; }
+    while (*pNumMsgs < want) {
+        int remaining = (int32_t)(deadline - mvci_now_ms());
+        if (Timeout && remaining <= 0) return pipeline_error(MVCI_PIPE_TIMEOUT);
+        uint8_t buf[MVCI_PIPE_MAX_DATA], rx = 0;
+        int m = mvci_poll(s->ctx, buf, sizeof buf, &rx, Timeout ? remaining : 0);
+        if (m < 0) return pipeline_error(m);
+        if (m > 0 && (s->loopback || rx != 2 || (m == 1 && buf[0] == 0x48))) {
+            PASSTHRU_MSG *o = &pMsg[*pNumMsgs];
             memset(o, 0, sizeof *o);
             o->ProtocolID = s->proto;
-            o->RxStatus   = rx;                       /* 0 = data, 2 = tx echo */
-            o->DataSize   = (uint32_t)m;
+            o->RxStatus = rx;
+            o->DataSize = (uint32_t)m;
             memcpy(o->Data, buf, (size_t)m);
-            got++;
+            ++*pNumMsgs;
             continue;
         }
-        if ((int32_t)(deadline - mvci_now_ms()) <= 0) break;
-        mvci_sleep_ms(5);
+        if (!Timeout) {
+            if (m > 0) continue; /* suppressed echo; continue the nonblocking drain */
+            if (*pNumMsgs) return STATUS_NOERROR;
+            set_err("no message available");
+            return ERR_BUFFER_EMPTY;
+        }
+        /* A valid empty reply can be immediate. Pace within the same budget;
+         * virtual-clock tests exercise this without wall-clock sleeps. */
+        remaining = (int32_t)(deadline - mvci_now_ms());
+        if (remaining <= 0) return pipeline_error(MVCI_PIPE_TIMEOUT);
+        if (!m) mvci_sleep_ms(remaining < 5 ? remaining : 5);
     }
-
-    *pNumMsgs = got;
-    if (got == 0) { set_err("no message"); return ERR_BUFFER_EMPTY; }
     return STATUS_NOERROR;
 }
 

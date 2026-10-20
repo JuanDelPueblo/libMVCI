@@ -4,6 +4,7 @@
 #include <mvci/serial.h>
 #include "io.h"
 #include "compat.h"
+#include "pipeline.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -248,6 +249,10 @@ struct mvci_ctx {
     uint8_t          pending[16][MVCI_MAX_INNER];
     int              pending_len[16];
     int              pending_count;
+    uint8_t          rx_frame[MVCI_MAX_FRAME];
+    int              rx_used;
+    int              poisoned; /* Unknown outstanding result: close/reopen required. */
+    int              overflow;
     mvci_mutex_t     lock;       /* serialises device I/O */
     mvci_thread_t    ka_thread;
     volatile int     ka_run;
@@ -293,18 +298,91 @@ const uint8_t *mvci_key(const mvci_ctx_t *ctx)
     return ctx->have_key ? ctx->key : NULL;
 }
 
-/* read one framed message: LEN byte, then LEN-1 more bytes */
+/* Retain fragments across nonblocking drains. A partial command reply at its
+ * deadline poisons the transaction in the caller; never guess a new boundary. */
 static int read_frame(mvci_ctx_t *ctx, uint8_t *buf, int cap, int timeout_ms)
 {
     uint32_t deadline = mvci_now_ms() + (uint32_t)timeout_ms;
-    uint8_t len;
-    if (mvci_io_read(ctx->io, &len, 1, timeout_ms) < 1) return -1;
-    if (len < 3 || len > cap) return -1;
-    buf[0] = len;
-    int remaining = (int32_t)(deadline - mvci_now_ms());
-    if (remaining <= 0 || mvci_io_read(ctx->io, buf + 1, len - 1, remaining) < len - 1)
-        return -1;
-    return len;
+    for (;;) {
+        int target = ctx->rx_used ? ctx->rx_frame[0] : 1;
+        if (target < 1 || (ctx->rx_used && target < 3) || target > cap)
+            return MVCI_PIPE_DESYNC;
+        if (ctx->rx_used == target && target > 1) {
+            memcpy(buf, ctx->rx_frame, (size_t)target);
+            ctx->rx_used = 0;
+            return target;
+        }
+        int remaining = (int32_t)(deadline - mvci_now_ms());
+        if (remaining < 0) remaining = 0;
+        int n = mvci_io_read(ctx->io, ctx->rx_frame + ctx->rx_used,
+                             target - ctx->rx_used, remaining);
+        if (n < 0) return MVCI_PIPE_IO;
+        if (!n) return 0;
+        if (n > target - ctx->rx_used) return MVCI_PIPE_DESYNC;
+        ctx->rx_used += n;
+    }
+}
+
+/* Decode into the full wire capacity, independently of a command's small ACK
+ * buffer. Both unsolicited and solicited diagnostic records admit 1..64 bytes. */
+static int receive_inner(mvci_ctx_t *ctx, uint8_t *inner, int timeout_ms)
+{
+    uint8_t frame[MVCI_MAX_FRAME];
+    int n = read_frame(ctx, frame, sizeof frame, timeout_ms);
+    if (n <= 0) return n;
+    int r = mvci_frame_decrypt(ctx->key, frame, n, inner, MVCI_MAX_INNER);
+    if (r < 4 || inner[1] != 0) return MVCI_PIPE_DESYNC;
+    return r;
+}
+
+static int read_record(const uint8_t *inner, int r)
+{
+    if (inner[2] != 0x09) return MVCI_PIPE_DESYNC;
+    int n = (int)inner[0] - 9;
+    if (n <= 0) {
+        /* Zero is the mock/ordinary empty result, 0x10 is the captured empty
+         * poll. Unknown result codes must not become an empty queue. */
+        return r == 8 && inner[0] == 2 &&
+               (inner[3] == 0 || inner[3] == 0x10) ? 0 : MVCI_PIPE_REJECTED;
+    }
+    return n <= MVCI_PIPE_MAX_DATA && 11 + n <= r ? n : MVCI_PIPE_DESYNC;
+}
+
+/* Drain completed empty records too: an empty status must not hide an
+ * already-buffered diagnostic frame from a Timeout=0 caller. */
+static int drain_record(mvci_ctx_t *ctx, uint8_t *inner)
+{
+    for (int i = 0; i < 32; i++) {
+        int r = receive_inner(ctx, inner, 0);
+        if (r <= 0) return r;
+        int n = read_record(inner, r);
+        if (n < 0) return n;
+        if (n > 0) return r;
+    }
+    return MVCI_PIPE_DESYNC; /* Refuse an unexplained burst of orphan statuses. */
+}
+
+static int queue_record(mvci_ctx_t *ctx, const uint8_t *inner, int r)
+{
+    int n = read_record(inner, r);
+    if (n <= 0) return n;
+    if (ctx->pending_count == 16) {
+        ctx->overflow = 1;
+        return MVCI_PIPE_OVERFLOW;
+    }
+    int slot = ctx->pending_count++;
+    memcpy(ctx->pending[slot], inner, (size_t)r);
+    ctx->pending_len[slot] = r;
+    return 0;
+}
+
+/* The result is byte 3 in the supported ACK shapes. The final padded byte is
+ * opaque: the captured successful stop-filter ACK ends in B8. Init replies
+ * have separate exact classifiers and must never pass through this helper. */
+static int ack_ok(const uint8_t *resp, int r, uint8_t opcode)
+{
+    return r == 8 && resp[0] == 2 && resp[1] == 0 &&
+           resp[2] == opcode && resp[3] == 0;
 }
 
 /* reset + identify + read challenge -> install key. Caller must hold ctx->lock
@@ -314,6 +392,9 @@ static int do_handshake(mvci_ctx_t *ctx)
     uint8_t frame[MVCI_MAX_FRAME];
     int n;
 
+    ctx->have_key = 0;
+    ctx->rx_used = 0;
+    ctx->pending_count = 0;
     n = mvci_frame_plain(NULL, 0, frame, sizeof frame);     /* reset */
     mvci_io_purge_rx(ctx->io);
     if (mvci_io_write(ctx->io, frame, n) != n) return -1;
@@ -325,7 +406,7 @@ static int do_handshake(mvci_ctx_t *ctx)
     if (mvci_io_write(ctx->io, frame, n) != n) return -1;
 
     n = read_frame(ctx, frame, sizeof frame, 2000);
-    if (n < 0) return -1;
+    if (n <= 0) return -1;
 
     const uint8_t *pl;
     int plen = mvci_frame_payload(frame, n, &pl);
@@ -341,46 +422,99 @@ int mvci_handshake(mvci_ctx_t *ctx)
     return do_handshake(ctx);
 }
 
-/* unlocked core transaction (caller holds ctx->lock) */
+/* Caller budgets include waiting for the I/O owner. A zero-timeout drain
+ * never waits behind a command transaction. */
+static int lock_until(mvci_ctx_t *ctx, uint32_t deadline, int may_wait)
+{
+    for (;;) {
+        if (may_wait && (int32_t)(deadline - mvci_now_ms()) <= 0) return 0;
+#ifdef _WIN32
+        if (TryEnterCriticalSection(&ctx->lock)) return 1;
+#else
+        if (pthread_mutex_trylock(&ctx->lock) == 0) return 1;
+#endif
+        int remaining = (int32_t)(deadline - mvci_now_ms());
+        if (!may_wait || remaining <= 0) return 0;
+        mvci_sleep_ms(1);
+    }
+}
+
+/* One outstanding command only. Never retry after losing its result. There
+ * is no sequence field on this wire; a purge or quiet interval cannot prove
+ * that a late same-opcode ACK is gone. A poisoned context requires Close/Open.
+ * Preflight rejects already-buffered unsolicited ACKs before sending anything.
+ * Arbitrarily delayed duplicate ACKs after a completed command still require
+ * physical/protocol evidence; this code does not claim to disambiguate them. */
 static int transact_locked(mvci_ctx_t *ctx, const uint8_t *inner, size_t inner_len,
                            uint8_t *resp_inner, size_t resp_cap, int timeout_ms)
 {
-    uint8_t frame[MVCI_MAX_FRAME];
-    int n = mvci_frame_enc(ctx->key, inner, inner_len, frame, sizeof frame);
-    if (n < 0) return -1;
-
-    dbg_hex("TX inner:", inner, (int)inner_len);
-    if (mvci_io_write(ctx->io, frame, n) != n) return -1;
+    if (ctx->poisoned) return MVCI_PIPE_DESYNC;
+    if (timeout_ms <= 0) return MVCI_PIPE_TIMEOUT;
     uint32_t deadline = mvci_now_ms() + (uint32_t)timeout_ms;
-    for (;;) {
-        int remaining = (int32_t)(deadline - mvci_now_ms());
-        if (remaining <= 0) return -1;
-        n = read_frame(ctx, frame, sizeof frame, remaining);
-        if (n < 0) { if (dbg_on()) fprintf(stderr, "  RX: timeout\n"); return -1; }
-        int r = mvci_frame_decrypt(ctx->key, frame, n, resp_inner, resp_cap);
-        if (r < 3 || resp_inner[1] != 0) {
-            dbg_hex("RX raw(bad):", frame, n);
-            return -1;
+    uint8_t frame[MVCI_MAX_FRAME], received[MVCI_MAX_INNER];
+    int n = mvci_frame_enc(ctx->key, inner, inner_len, frame, sizeof frame);
+    if (n < 0) return MVCI_PIPE_DESYNC;
+    /* Bound an unsolicited burst. Overflow is explicit and fatal to command
+     * ordering; retained records remain available after the loss report. */
+    for (int i = 0; ; i++) {
+        int r = receive_inner(ctx, received, 0);
+        if (r < 0) { ctx->poisoned = 1; return r; }
+        if (!r) break;
+        r = queue_record(ctx, received, r);
+        if (r < 0 || i >= 32) {
+            ctx->poisoned = 1;
+            return r < 0 ? r : MVCI_PIPE_DESYNC;
         }
-        dbg_hex("RX inner:", resp_inner, r);
-        if (resp_inner[2] == inner[2]) return r;
-        /* A message may arrive before a command acknowledgement. Preserve it
-         * for the next read instead of flushing it or mistaking it for ACK. */
-        if (resp_inner[2] != 0x09) return -1;
-        int mlen = (int)resp_inner[0] - 9;
-        if (mlen <= 0) continue; /* empty read/keepalive status */
-        if (11 + mlen > r || ctx->pending_count >= 16) return -1;
-        int slot = ctx->pending_count++;
-        memcpy(ctx->pending[slot], resp_inner, (size_t)r);
-        ctx->pending_len[slot] = r;
+        if ((int32_t)(deadline - mvci_now_ms()) <= 0) return MVCI_PIPE_TIMEOUT;
+    }
+    if (ctx->rx_used) { ctx->poisoned = 1; return MVCI_PIPE_DESYNC; }
+    int remaining = (int32_t)(deadline - mvci_now_ms());
+    if (remaining <= 0) return MVCI_PIPE_TIMEOUT;
+    dbg_hex("TX inner:", inner, (int)inner_len);
+    int w = mvci_io_write_timeout(ctx->io, frame, n, remaining);
+    if (w != n) {
+        ctx->poisoned = 1; /* A partial write may have reached the adapter. */
+        return w < 0 ? MVCI_PIPE_IO : MVCI_PIPE_TIMEOUT;
+    }
+    for (;;) {
+        remaining = (int32_t)(deadline - mvci_now_ms());
+        int r = remaining > 0 ? receive_inner(ctx, received, remaining) : 0;
+        if (r <= 0) {
+            ctx->poisoned = 1;
+            return r < 0 ? r : MVCI_PIPE_TIMEOUT;
+        }
+        dbg_hex("RX inner:", received, r);
+        if (received[2] == inner[2]) {
+            int init_reply = inner[2] == 0x0e && inner_len >= 4 &&
+                             (inner[3] == 4 || inner[3] == 5);
+            if (!init_reply && inner[2] != 9 &&
+                (r != 8 || received[0] != 2)) {
+                ctx->poisoned = 1;
+                return MVCI_PIPE_DESYNC;
+            }
+            if ((int32_t)(deadline - mvci_now_ms()) < 0) {
+                ctx->poisoned = 1;
+                return MVCI_PIPE_TIMEOUT;
+            }
+            if ((size_t)r > resp_cap) { ctx->poisoned = 1; return MVCI_PIPE_DESYNC; }
+            memcpy(resp_inner, received, (size_t)r);
+            return r;
+        }
+        int q = queue_record(ctx, received, r);
+        if (q < 0) { ctx->poisoned = 1; return q; }
     }
 }
 
 int mvci_transact(mvci_ctx_t *ctx, const uint8_t *inner, size_t inner_len,
                   uint8_t *resp_inner, size_t resp_cap, int timeout_ms)
 {
-    if (!ctx->have_key) return -1;
-    mvci_mutex_lock(&ctx->lock);
+    if (!ctx || !ctx->have_key || !inner || inner_len < 3 ||
+        !resp_inner || timeout_ms < 0) return MVCI_PIPE_DESYNC;
+    uint32_t started = mvci_now_ms();
+    if (!lock_until(ctx, started + (uint32_t)timeout_ms, timeout_ms > 0))
+        return MVCI_PIPE_TIMEOUT;
+    int elapsed = (int32_t)(mvci_now_ms() - started);
+    timeout_ms = elapsed >= timeout_ms ? 0 : timeout_ms - elapsed;
     int r = transact_locked(ctx, inner, inner_len, resp_inner, resp_cap, timeout_ms);
     mvci_mutex_unlock(&ctx->lock);
     return r;
@@ -433,14 +567,11 @@ int mvci_connect(mvci_ctx_t *ctx, uint32_t proto, uint32_t flags, uint32_t baud)
 
     mvci_mutex_lock(&ctx->lock);
     int r = transact_locked(ctx, in, n, resp, sizeof resp, 2000);
-    int ok = (r >= 3 && resp[0] == 0x02 && resp[2] == 0x07);
+    int ok = ack_ok(resp, r, 0x07);
 
-    /* After a prior Disconnect the device is de-initialised and ignores Connect
-     * until it is reset; re-run the handshake (03/07/09) and retry once. */
-    if (!ok && do_handshake(ctx) == 0) {
-        r = transact_locked(ctx, in, n, resp, sizeof resp, 2000);
-        ok = (r >= 3 && resp[0] == 0x02 && resp[2] == 0x07);
-    }
+    /* Do not retry a missing/rejected Connect result. A missing ACK has no
+     * safe same-session correlation. Lifecycle recovery must establish its
+     * reset boundary before issuing a fresh Connect, or require Close/Open. */
     if (ok) ctx->proto = proto;
     mvci_mutex_unlock(&ctx->lock);
     return ok ? 0 : -1;
@@ -479,7 +610,7 @@ int mvci_start_filter(mvci_ctx_t *ctx, uint32_t msgid, uint8_t mask, uint8_t pat
     uint8_t in[32], resp[64];
     int n = mvci_inner_start_filter(ctx->proto, msgid, 1 /*PASS*/, mask, pattern, in);
     int r = mvci_transact(ctx, in, n, resp, sizeof resp, 2000);
-    return (r >= 3 && resp[0] == 0x02 && resp[2] == 0x0b) ? 0 : -1;
+    return ack_ok(resp, r, 0x0b) ? 0 : -1;
 }
 
 int mvci_stop_filter(mvci_ctx_t *ctx, uint32_t msgid)
@@ -487,7 +618,7 @@ int mvci_stop_filter(mvci_ctx_t *ctx, uint32_t msgid)
     uint8_t in[16], resp[64];
     int n = mvci_inner_stop_filter(ctx->proto, msgid, in);
     int r = mvci_transact(ctx, in, n, resp, sizeof resp, 2000);
-    return (r >= 3 && resp[0] == 0x02 && resp[2] == 0x0c) ? 0 : -1;
+    return ack_ok(resp, r, 0x0c) ? 0 : -1;
 }
 
 int mvci_set_config(mvci_ctx_t *ctx, uint32_t param, uint32_t value)
@@ -497,7 +628,7 @@ int mvci_set_config(mvci_ctx_t *ctx, uint32_t param, uint32_t value)
     int r = mvci_transact(ctx, in, sizeof in, resp, sizeof resp, 2000);
     /* A nonzero cable status is a failure, not an applied setting. Even a
      * success ACK proves command acceptance only, not electrical timing. */
-    return (r >= 4 && resp[0] == 0x02 && resp[2] == 0x0e && resp[3] == 0) ? 0 : -1;
+    return ack_ok(resp, r, 0x0e) ? 0 : -1;
 }
 
 int mvci_set_prog_voltage(mvci_ctx_t *ctx, uint32_t pin, uint32_t voltage)
@@ -506,7 +637,7 @@ int mvci_set_prog_voltage(mvci_ctx_t *ctx, uint32_t pin, uint32_t voltage)
     int n = mvci_inner_prog_voltage(pin, voltage, in);
     if (n < 0) return -1;
     int r = mvci_transact(ctx, in, (size_t)n, resp, sizeof resp, 2000);
-    return (r >= 3 && resp[0] == 0x02 && resp[2] == 0x0d) ? 0 : -1;
+    return ack_ok(resp, r, 0x0d) ? 0 : -1;
 }
 
 int mvci_five_baud_init(mvci_ctx_t *ctx, const uint8_t *addr, size_t naddr,
@@ -532,7 +663,7 @@ int mvci_clear_periodic(mvci_ctx_t *ctx)
     uint8_t in[8], resp[64];
     int n = mvci_inner_clear_periodic(ctx->proto, in);
     int r = mvci_transact(ctx, in, n, resp, sizeof resp, 1000);
-    return (r >= 3 && resp[0] == 0x02 && resp[2] == 0x0e) ? 0 : -1;
+    return ack_ok(resp, r, 0x0e) ? 0 : -1;
 }
 
 int mvci_fast_init(mvci_ctx_t *ctx, const uint8_t *init, size_t n,
@@ -556,41 +687,62 @@ int mvci_fast_init(mvci_ctx_t *ctx, const uint8_t *init, size_t n,
     return mlen;
 }
 
+int mvci_write_msg_timeout(mvci_ctx_t *ctx, const uint8_t *msg, size_t n, int timeout_ms)
+{
+    uint8_t in[MVCI_MAX_INNER], resp[8];
+    if (!msg || !n || n > MVCI_PIPE_MAX_DATA) return MVCI_PIPE_DESYNC;
+    int ilen = mvci_inner_write_msg(ctx->proto, msg, n, in);
+    if (ilen < 0) return MVCI_PIPE_DESYNC;
+    int r = mvci_transact(ctx, in, ilen, resp, sizeof resp, timeout_ms);
+    if (r < 0) return r;
+    return ack_ok(resp, r, 0x0a) ? 0 : MVCI_PIPE_REJECTED;
+}
+
 int mvci_write_msg(mvci_ctx_t *ctx, const uint8_t *msg, size_t n)
 {
-    uint8_t in[MVCI_MAX_INNER], resp[64];
-    int ilen = mvci_inner_write_msg(ctx->proto, msg, n, in);
-    if (ilen < 0) return -1;
-    int r = mvci_transact(ctx, in, ilen, resp, sizeof resp, 1000);
-    /* PROTOCOL.md 5.1 documents the write reply as status 02 00 0A. Every other
-     * command here validates its status reply the same way. Accepting any reply
-     * at all reported success for a write the device had rejected, so a caller
-     * could not tell a transmitted frame from a refused one. */
-    return (r >= 3 && resp[0] == 0x02 && resp[2] == 0x0a) ? 0 : -1;
+    return mvci_write_msg_timeout(ctx, msg, n, 1000);
 }
 
 int mvci_poll(mvci_ctx_t *ctx, uint8_t *msg_out, size_t cap,
               uint8_t *rxstatus_out, int timeout_ms)
 {
     uint8_t in[8], resp[MVCI_MAX_INNER];
-    int n = mvci_inner_read_poll(ctx->proto, in);
-    if (!ctx->have_key) return -1;
-    mvci_mutex_lock(&ctx->lock);
+    if (!ctx || !ctx->have_key || !msg_out || timeout_ms < 0) return MVCI_PIPE_DESYNC;
+    uint32_t deadline = mvci_now_ms() + (uint32_t)timeout_ms;
+    if (!lock_until(ctx, deadline, timeout_ms > 0)) return MVCI_PIPE_TIMEOUT;
     int r;
-    if (ctx->pending_count) {
+    if (ctx->overflow) {
+        ctx->overflow = 0;
+        r = MVCI_PIPE_OVERFLOW;
+    } else if (ctx->pending_count) {
         r = ctx->pending_len[0];
         memcpy(resp, ctx->pending[0], (size_t)r);
         ctx->pending_count--;
-        memmove(ctx->pending, ctx->pending + 1,
-                (size_t)ctx->pending_count * sizeof ctx->pending[0]);
-        memmove(ctx->pending_len, ctx->pending_len + 1,
-                (size_t)ctx->pending_count * sizeof ctx->pending_len[0]);
+        memmove(ctx->pending, ctx->pending + 1, (size_t)ctx->pending_count * sizeof ctx->pending[0]);
+        memmove(ctx->pending_len, ctx->pending_len + 1, (size_t)ctx->pending_count * sizeof ctx->pending_len[0]);
+    } else if (ctx->poisoned) {
+        r = MVCI_PIPE_DESYNC;
     } else {
-        r = transact_locked(ctx, in, (size_t)n, resp, sizeof resp, timeout_ms);
+        r = drain_record(ctx, resp);
+        if (!r && timeout_ms && !ctx->rx_used) {
+            int remaining = (int32_t)(deadline - mvci_now_ms());
+            int n = mvci_inner_read_poll(ctx->proto, in);
+            r = remaining > 0 ? transact_locked(ctx, in, n, resp, sizeof resp, remaining) : MVCI_PIPE_TIMEOUT;
+        } else if (!r && timeout_ms && ctx->rx_used) {
+            int remaining = (int32_t)(deadline - mvci_now_ms());
+            r = receive_inner(ctx, resp, remaining > 0 ? remaining : 0);
+        }
+        if (r < 0) ctx->poisoned = 1;
+    }
+    if (r > 0) {
+        int n = read_record(resp, r);
+        if (n < 0) { ctx->poisoned = 1; r = n; }
+        else if ((size_t)n > cap) r = MVCI_PIPE_OVERFLOW;
+        else if (!n) r = 0;
+        else r = mvci_parse_read_reply(resp, r, msg_out, cap, rxstatus_out);
     }
     mvci_mutex_unlock(&ctx->lock);
-    if (r < 0) return -1;
-    return mvci_parse_read_reply(resp, r, msg_out, cap, rxstatus_out);
+    return r;
 }
 
 int mvci_clear_rx_buffer(mvci_ctx_t *ctx)
@@ -598,7 +750,10 @@ int mvci_clear_rx_buffer(mvci_ctx_t *ctx)
     if (!ctx || !ctx->have_key) return -1;
     mvci_mutex_lock(&ctx->lock);
     ctx->pending_count = 0;
+    ctx->rx_used = 0;
+    ctx->overflow = 0;
     mvci_io_purge_rx(ctx->io);
+    /* Clearing host RX is not an ACK/session recovery boundary. */
     mvci_mutex_unlock(&ctx->lock);
     return 0;
 }
@@ -607,6 +762,7 @@ int mvci_read_msg(mvci_ctx_t *ctx, uint8_t *msg_out, size_t cap, int timeout_ms)
 {
     uint8_t rx = 0;
     int m = mvci_poll(ctx, msg_out, cap, &rx, timeout_ms);
+    if (m < 0) return m;
     if (m > 0 && rx == 0x00) return m;       /* data */
     return 0;                                 /* echo / none */
 }

@@ -286,3 +286,10 @@ void mvci_io_purge_rx(mvci_io_t *io)
     (void)io;
     g_qhead = g_qtail = 0;
 }
+
+/* Deadline transport entry point used by the real session pipeline. */
+int mvci_io_write_timeout(mvci_io_t *io, const uint8_t *buf, int n, int timeout_ms)
+{
+    (void)timeout_ms;
+    return mvci_io_write(io, buf, n);
+}

@@ -313,7 +313,7 @@ static void test_queued_diagnostic_reply(void)
         ok(set_one(ch, DATA_RATE, 10400) == STATUS_NOERROR,
            "previous empty poll status cannot replace the next config ACK");
         count = 1;
-        ok(PassThruReadMsgs(ch, &rx, &count, 10) == ERR_BUFFER_EMPTY && count == 0,
+        ok(PassThruReadMsgs(ch, &rx, &count, 10) == ERR_TIMEOUT && count == 0,
            "queued reply is delivered once");
 
         mock_async_reply(mode);
@@ -325,7 +325,7 @@ static void test_queued_diagnostic_reply(void)
            "explicit RX clear succeeds");
         ok(mock_frame_count() == before, "local RX clear sends no adapter command");
         count = 1;
-        ok(PassThruReadMsgs(ch, &rx, &count, 10) == ERR_BUFFER_EMPTY && count == 0,
+        ok(PassThruReadMsgs(ch, &rx, &count, 10) == ERR_TIMEOUT && count == 0,
            "explicit RX clear removes software and serial queued replies");
         ok(PassThruDisconnect(ch) == STATUS_NOERROR, "diagnostic test disconnect");
         ok(PassThruClose(dev) == STATUS_NOERROR, "diagnostic test close");

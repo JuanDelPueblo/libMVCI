@@ -21,6 +21,10 @@ void       mvci_io_close(mvci_io_t *io);
 /* write all n bytes; returns n on success, -1 on error */
 int  mvci_io_write(mvci_io_t *io, const uint8_t *buf, int n);
 
+/* Deadline-aware write: returns bytes accepted (possibly partial), or -1.
+ * timeout_ms=0 never waits. Acceptance is host I/O, not physical transmission. */
+int mvci_io_write_timeout(mvci_io_t *io, const uint8_t *buf, int n, int timeout_ms);
+
 /* read up to n bytes within timeout_ms; returns bytes read (may be < n) or -1 */
 int  mvci_io_read(mvci_io_t *io, uint8_t *buf, int n, int timeout_ms);
 
