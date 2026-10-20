@@ -33,6 +33,12 @@ _Static_assert(sizeof(SCONFIG) == 8, "SCONFIG must be 8 bytes");
 
 #define MAX_SLOTS   4
 #define MAX_FILTERS 32
+#define J2534_VERSION_TEXT_SIZE 80
+#ifdef _MSC_VER
+#define MVCI_THREAD_LOCAL __declspec(thread)
+#else
+#define MVCI_THREAD_LOCAL _Thread_local
+#endif
 
 typedef struct {
     int          open;
@@ -48,14 +54,18 @@ typedef struct {
 static slot_t       g_slot[MAX_SLOTS];
 static mvci_mutex_t g_lock;
 static int          g_init = 0;
-static char         g_last_error[128] = "No error";
+static MVCI_THREAD_LOCAL char g_last_error[J2534_VERSION_TEXT_SIZE] = "No error";
 
 static void ensure_init(void)
 {
     if (!g_init) { mvci_mutex_init(&g_lock); g_init = 1; }
 }
 
-static void set_err(const char *s) { strncpy(g_last_error, s, sizeof g_last_error - 1); }
+static void set_err(const char *s)
+{
+    if (!s) s = "unspecified error";
+    (void)snprintf(g_last_error, sizeof g_last_error, "%s", s);
+}
 
 /* device/channel/filter id encoding: dev = slot+1, channel = slot+0x100 */
 #define DEV_ID(s)         ((J2534_ULONG)((s) + 1))
@@ -501,18 +511,24 @@ J2534_LONG J2534_API PassThruReadVersion(J2534_ULONG DeviceID, char *pFirmwareVe
                                    char *pDllVersion, char *pApiVersion)
 {
     ensure_init();
-    if (!dev_slot(DeviceID)) return ERR_INVALID_DEVICE_ID;
-    /* Report the same identity as the original Mini-VCI DLL so the host app
-     * (e.g. Toyota Techstream) recognises the adapter and selects ISO14230. */
-    if (pFirmwareVersion) strcpy(pFirmwareVersion, "J2534 MINIV1.03");
-    if (pDllVersion)      strcpy(pDllVersion, "MVCI J2534 DLL v1.4.6");
-    if (pApiVersion)      strcpy(pApiVersion, "04.04");
+    if (!dev_slot(DeviceID)) { set_err("invalid device id"); return ERR_INVALID_DEVICE_ID; }
+    if (!pFirmwareVersion || !pDllVersion || !pApiVersion) {
+        set_err("NULL version output");
+        return ERR_NULL_PARAMETER;
+    }
+    /* J2534 defines these output strings as 80-byte fields, but provides no
+     * capacity arguments. The adapter firmware is not queried by this driver. */
+    (void)snprintf(pFirmwareVersion, J2534_VERSION_TEXT_SIZE,
+                   "%s", "Unknown (not queried)");
+    (void)snprintf(pDllVersion, J2534_VERSION_TEXT_SIZE,
+                   "%s", "libMVCI 1.0.0");
+    (void)snprintf(pApiVersion, J2534_VERSION_TEXT_SIZE, "%s", "04.04");
     return STATUS_NOERROR;
 }
 
 J2534_LONG J2534_API PassThruGetLastError(char *pErrorDescription)
 {
-    if (!pErrorDescription) return ERR_NULL_PARAMETER;
-    strcpy(pErrorDescription, g_last_error);
+    if (!pErrorDescription) { set_err("NULL error output"); return ERR_NULL_PARAMETER; }
+    (void)snprintf(pErrorDescription, J2534_VERSION_TEXT_SIZE, "%s", g_last_error);
     return STATUS_NOERROR;
 }
