@@ -326,11 +326,15 @@ J2534_LONG J2534_API PassThruReadMsgs(J2534_ULONG ChannelID, PASSTHRU_MSG *pMsg,
     if (!s || !s->connected) { set_err("invalid channel id"); return ERR_INVALID_CHANNEL_ID; }
     if (!pMsg || !want) { set_err("NULL/empty msg"); return ERR_NULL_PARAMETER; }
     if (Timeout > INT_MAX) { set_err("timeout exceeds supported monotonic interval"); return ERR_INVALID_TIME_INTERVAL; }
+    unsigned work_left = MVCI_PIPE_READ_BUDGET;
     while (*pNumMsgs < want) {
         int remaining = (int32_t)(deadline - mvci_now_ms());
         if (Timeout && remaining <= 0) return pipeline_error(MVCI_PIPE_TIMEOUT);
+        if (Timeout) work_left = MVCI_PIPE_READ_BUDGET;
+        else if (!work_left) break;
         uint8_t buf[MVCI_PIPE_MAX_DATA], rx = 0;
-        int m = mvci_poll(s->ctx, buf, sizeof buf, &rx, Timeout ? remaining : 0);
+        int m = mvci_poll_until(s->ctx, buf, sizeof buf, &rx, deadline,
+                                Timeout != 0, &work_left);
         if (m < 0) return pipeline_error(m);
         if (m > 0 && (s->loopback || rx != 2 || (m == 1 && buf[0] == 0x48))) {
             PASSTHRU_MSG *o = &pMsg[*pNumMsgs];
@@ -354,7 +358,9 @@ J2534_LONG J2534_API PassThruReadMsgs(J2534_ULONG ChannelID, PASSTHRU_MSG *pMsg,
         if (remaining <= 0) return pipeline_error(MVCI_PIPE_TIMEOUT);
         if (!m) mvci_sleep_ms(remaining < 5 ? remaining : 5);
     }
-    return STATUS_NOERROR;
+    if (*pNumMsgs) return STATUS_NOERROR;
+    set_err("no message available");
+    return ERR_BUFFER_EMPTY;
 }
 
 J2534_LONG J2534_API PassThruIoctl(J2534_ULONG ChannelID, J2534_ULONG IoctlID,

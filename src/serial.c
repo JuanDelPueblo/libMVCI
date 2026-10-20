@@ -301,10 +301,14 @@ const uint8_t *mvci_key(const mvci_ctx_t *ctx)
 
 /* Retain fragments across nonblocking drains. A partial command reply at its
  * deadline poisons the transaction in the caller; never guess a new boundary. */
-static int read_frame(mvci_ctx_t *ctx, uint8_t *buf, int cap, int timeout_ms)
+static int read_frame_until(mvci_ctx_t *ctx, uint8_t *buf, int cap,
+                             uint32_t deadline, int timed, int may_wait)
 {
-    uint32_t deadline = mvci_now_ms() + (uint32_t)timeout_ms;
     for (;;) {
+        /* A nonblocking transport call can still take execution time. Keep
+         * all bytes in rx_frame if it crosses the caller's deadline. */
+        int remaining = timed ? (int32_t)(deadline - mvci_now_ms()) : 0;
+        if (timed && remaining <= 0) return MVCI_PIPE_TIMEOUT;
         int target = ctx->rx_used ? ctx->rx_frame[0] : 1;
         if (target < 1 || (ctx->rx_used && target < 3) || target > cap)
             return MVCI_PIPE_DESYNC;
@@ -313,10 +317,8 @@ static int read_frame(mvci_ctx_t *ctx, uint8_t *buf, int cap, int timeout_ms)
             ctx->rx_used = 0;
             return target;
         }
-        int remaining = (int32_t)(deadline - mvci_now_ms());
-        if (remaining < 0) remaining = 0;
         int n = mvci_io_read(ctx->io, ctx->rx_frame + ctx->rx_used,
-                             target - ctx->rx_used, remaining);
+                             target - ctx->rx_used, may_wait ? remaining : 0);
         if (n < 0) return MVCI_PIPE_IO;
         if (!n) return 0;
         if (n > target - ctx->rx_used) return MVCI_PIPE_DESYNC;
@@ -324,12 +326,19 @@ static int read_frame(mvci_ctx_t *ctx, uint8_t *buf, int cap, int timeout_ms)
     }
 }
 
+static int read_frame(mvci_ctx_t *ctx, uint8_t *buf, int cap, int timeout_ms)
+{
+    return read_frame_until(ctx, buf, cap, mvci_now_ms() + (uint32_t)timeout_ms,
+                            timeout_ms > 0, timeout_ms > 0);
+}
+
 /* Decode into the full wire capacity, independently of a command's small ACK
  * buffer. Both unsolicited and solicited diagnostic records admit 1..64 bytes. */
-static int receive_inner(mvci_ctx_t *ctx, uint8_t *inner, int timeout_ms)
+static int receive_inner_until(mvci_ctx_t *ctx, uint8_t *inner,
+                                uint32_t deadline, int timed, int may_wait)
 {
     uint8_t frame[MVCI_MAX_FRAME];
-    int n = read_frame(ctx, frame, sizeof frame, timeout_ms);
+    int n = read_frame_until(ctx, frame, sizeof frame, deadline, timed, may_wait);
     if (n <= 0) return n;
     int r = mvci_frame_decrypt(ctx->key, frame, n, inner, MVCI_MAX_INNER);
     if (r < 4 || inner[1] != 0) return MVCI_PIPE_DESYNC;
@@ -351,16 +360,18 @@ static int read_record(const uint8_t *inner, int r)
 
 /* Drain completed empty records too: an empty status must not hide an
  * already-buffered diagnostic frame from a Timeout=0 caller. */
-static int drain_record(mvci_ctx_t *ctx, uint8_t *inner)
+static int drain_record(mvci_ctx_t *ctx, uint8_t *inner, uint32_t deadline,
+                         int timed, unsigned *work_left)
 {
-    for (int i = 0; i < 32; i++) {
-        int r = receive_inner(ctx, inner, 0);
+    while (*work_left) {
+        int r = receive_inner_until(ctx, inner, deadline, timed, 0);
         if (r <= 0) return r;
+        --*work_left;
         int n = read_record(inner, r);
         if (n < 0) return n;
         if (n > 0) return r;
     }
-    return MVCI_PIPE_DESYNC; /* Refuse an unexplained burst of orphan statuses. */
+    return 0; /* Fairness limit: leave the next valid record for a later call. */
 }
 
 static int queue_record(mvci_ctx_t *ctx, const uint8_t *inner, int r)
@@ -446,21 +457,23 @@ static int lock_until(mvci_ctx_t *ctx, uint32_t deadline, int may_wait)
  * Preflight rejects already-buffered unsolicited ACKs before sending anything.
  * Arbitrarily delayed duplicate ACKs after a completed command still require
  * physical/protocol evidence; this code does not claim to disambiguate them. */
-static int transact_locked(mvci_ctx_t *ctx, const uint8_t *inner, size_t inner_len,
-                           uint8_t *resp_inner, size_t resp_cap, int timeout_ms)
+static int transact_until_locked(mvci_ctx_t *ctx, const uint8_t *inner, size_t inner_len,
+                                 uint8_t *resp_inner, size_t resp_cap, uint32_t deadline)
 {
     if (ctx->rx_purge_failed) return MVCI_PIPE_IO;
     if (ctx->poisoned) return MVCI_PIPE_DESYNC;
-    if (timeout_ms <= 0) return MVCI_PIPE_TIMEOUT;
-    uint32_t deadline = mvci_now_ms() + (uint32_t)timeout_ms;
+    if ((int32_t)(deadline - mvci_now_ms()) <= 0) return MVCI_PIPE_TIMEOUT;
     uint8_t frame[MVCI_MAX_FRAME], received[MVCI_MAX_INNER];
     int n = mvci_frame_enc(ctx->key, inner, inner_len, frame, sizeof frame);
     if (n < 0) return MVCI_PIPE_DESYNC;
     /* Bound an unsolicited burst. Overflow is explicit and fatal to command
      * ordering; retained records remain available after the loss report. */
     for (int i = 0; ; i++) {
-        int r = receive_inner(ctx, received, 0);
-        if (r < 0) { ctx->poisoned = 1; return r; }
+        int r = receive_inner_until(ctx, received, deadline, 1, 0);
+        if (r < 0) {
+            if (r != MVCI_PIPE_TIMEOUT) ctx->poisoned = 1;
+            return r;
+        }
         if (!r) break;
         r = queue_record(ctx, received, r);
         if (r < 0 || i >= 32) {
@@ -480,7 +493,7 @@ static int transact_locked(mvci_ctx_t *ctx, const uint8_t *inner, size_t inner_l
     }
     for (;;) {
         remaining = (int32_t)(deadline - mvci_now_ms());
-        int r = remaining > 0 ? receive_inner(ctx, received, remaining) : 0;
+        int r = remaining > 0 ? receive_inner_until(ctx, received, deadline, 1, 1) : 0;
         if (r <= 0) {
             ctx->poisoned = 1;
             return r < 0 ? r : MVCI_PIPE_TIMEOUT;
@@ -505,6 +518,14 @@ static int transact_locked(mvci_ctx_t *ctx, const uint8_t *inner, size_t inner_l
         int q = queue_record(ctx, received, r);
         if (q < 0) { ctx->poisoned = 1; return q; }
     }
+}
+
+static int transact_locked(mvci_ctx_t *ctx, const uint8_t *inner, size_t inner_len,
+                           uint8_t *resp_inner, size_t resp_cap, int timeout_ms)
+{
+    if (timeout_ms <= 0) return MVCI_PIPE_TIMEOUT;
+    return transact_until_locked(ctx, inner, inner_len, resp_inner, resp_cap,
+                                  mvci_now_ms() + (uint32_t)timeout_ms);
 }
 
 int mvci_transact(mvci_ctx_t *ctx, const uint8_t *inner, size_t inner_len,
@@ -708,48 +729,74 @@ int mvci_write_msg(mvci_ctx_t *ctx, const uint8_t *msg, size_t n)
     return mvci_write_msg_timeout(ctx, msg, n, 1000) == 0 ? 0 : -1;
 }
 
-int mvci_poll(mvci_ctx_t *ctx, uint8_t *msg_out, size_t cap,
-              uint8_t *rxstatus_out, int timeout_ms)
+int mvci_poll_until(mvci_ctx_t *ctx, uint8_t *msg_out, size_t cap,
+                    uint8_t *rxstatus_out, uint32_t deadline, int timed,
+                    unsigned *work_left)
 {
     uint8_t in[8], resp[MVCI_MAX_INNER];
-    if (!ctx || !ctx->have_key || !msg_out || timeout_ms < 0) return MVCI_PIPE_DESYNC;
-    uint32_t deadline = mvci_now_ms() + (uint32_t)timeout_ms;
-    if (!lock_until(ctx, deadline, timeout_ms > 0)) return MVCI_PIPE_TIMEOUT;
-    int r;
+    if (!ctx || !ctx->have_key || !msg_out || !work_left) return MVCI_PIPE_DESYNC;
+    if (!lock_until(ctx, deadline, timed)) return MVCI_PIPE_TIMEOUT;
+    int r, from_pending = 0;
     if (ctx->rx_purge_failed) {
         r = MVCI_PIPE_IO;
     } else if (ctx->overflow) {
         ctx->overflow = 0;
         r = MVCI_PIPE_OVERFLOW;
+    } else if (!*work_left) {
+        r = 0;
     } else if (ctx->pending_count) {
         r = ctx->pending_len[0];
         memcpy(resp, ctx->pending[0], (size_t)r);
-        ctx->pending_count--;
-        memmove(ctx->pending, ctx->pending + 1, (size_t)ctx->pending_count * sizeof ctx->pending[0]);
-        memmove(ctx->pending_len, ctx->pending_len + 1, (size_t)ctx->pending_count * sizeof ctx->pending_len[0]);
+        from_pending = 1; /* Commit removal only within the caller deadline. */
+        --*work_left;
     } else if (ctx->poisoned) {
         r = MVCI_PIPE_DESYNC;
     } else {
-        r = drain_record(ctx, resp);
-        if (!r && timeout_ms && !ctx->rx_used) {
-            int remaining = (int32_t)(deadline - mvci_now_ms());
+        r = drain_record(ctx, resp, deadline, timed, work_left);
+        if (!r && timed && *work_left && !ctx->rx_used) {
             int n = mvci_inner_read_poll(ctx->proto, in);
-            r = remaining > 0 ? transact_locked(ctx, in, n, resp, sizeof resp, remaining) : MVCI_PIPE_TIMEOUT;
-        } else if (!r && timeout_ms && ctx->rx_used) {
-            int remaining = (int32_t)(deadline - mvci_now_ms());
-            r = receive_inner(ctx, resp, remaining > 0 ? remaining : 0);
+            r = transact_until_locked(ctx, in, n, resp, sizeof resp, deadline);
+            if (r > 0) --*work_left;
+        } else if (!r && timed && *work_left && ctx->rx_used) {
+            r = receive_inner_until(ctx, resp, deadline, 1, 1);
+            if (r > 0) --*work_left;
         }
-        if (r < 0) ctx->poisoned = 1;
+        /* A buffered-read timeout has no outstanding command. Retain its
+         * complete or partial frame; a command timeout poisons itself above. */
+        if (r < 0 && r != MVCI_PIPE_TIMEOUT) ctx->poisoned = 1;
     }
     if (r > 0) {
         int n = read_record(resp, r);
         if (n < 0) { ctx->poisoned = 1; r = n; }
+        else if (timed && (int32_t)(deadline - mvci_now_ms()) <= 0) {
+            int q = n && !from_pending ? queue_record(ctx, resp, r) : 0;
+            if (q < 0) ctx->poisoned = 1;
+            r = q < 0 ? q : MVCI_PIPE_TIMEOUT;
+        }
         else if ((size_t)n > cap) r = MVCI_PIPE_OVERFLOW;
-        else if (!n) r = 0;
-        else r = mvci_parse_read_reply(resp, r, msg_out, cap, rxstatus_out);
+        else {
+            if (from_pending) {
+                ctx->pending_count--;
+                memmove(ctx->pending, ctx->pending + 1, (size_t)ctx->pending_count * sizeof ctx->pending[0]);
+                memmove(ctx->pending_len, ctx->pending_len + 1, (size_t)ctx->pending_count * sizeof ctx->pending_len[0]);
+            }
+            r = n ? mvci_parse_read_reply(resp, r, msg_out, cap, rxstatus_out) : 0;
+        }
+    } else if (!r && timed && (int32_t)(deadline - mvci_now_ms()) <= 0) {
+        r = MVCI_PIPE_TIMEOUT;
     }
     mvci_mutex_unlock(&ctx->lock);
     return r;
+}
+
+int mvci_poll(mvci_ctx_t *ctx, uint8_t *msg_out, size_t cap,
+              uint8_t *rxstatus_out, int timeout_ms)
+{
+    if (timeout_ms < 0) return MVCI_PIPE_DESYNC;
+    unsigned work_left = MVCI_PIPE_READ_BUDGET;
+    return mvci_poll_until(ctx, msg_out, cap, rxstatus_out,
+                           mvci_now_ms() + (uint32_t)timeout_ms,
+                           timeout_ms > 0, &work_left);
 }
 
 int mvci_clear_rx_buffer(mvci_ctx_t *ctx)

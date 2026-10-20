@@ -6,6 +6,7 @@
 #include <mvci/serial.h>
 #include "io.h"
 #include "compat.h"
+#include "pipeline.h"
 #ifdef NDEBUG
 #undef NDEBUG
 #endif
@@ -39,6 +40,8 @@ int __wrap_nanosleep(const struct timespec *t, struct timespec *rest)
 static int reject_op, reject_at, op_calls, drop_op, lost, chunk;
 static int tx_delay, read_wait, async_len, async_count, bad_poll;
 static int tx_budget, lock_busy, init_success;
+static int rx_stream, stream_generated, immediate_reads, max_read_timeout;
+static uint64_t immediate_ns;
 int __real_pthread_mutex_trylock(pthread_mutex_t *);
 int __wrap_pthread_mutex_trylock(pthread_mutex_t *mutex)
 {
@@ -50,8 +53,22 @@ int mvci_io_read(mvci_io_t *io, uint8_t *buf, int n, int timeout_ms)
 {
     assert(timeout_ms >= 0);
     if (lost) return -1;
+    if (timeout_ms > max_read_timeout) max_read_timeout = timeout_ms;
+    if (rx_stream && g_qhead == g_qtail) {
+        /* An infinite source: the public call must stop itself. The guard
+         * fails the test instead of injecting EOF to make the call return. */
+        assert(++stream_generated <= 1024);
+        if (rx_stream == 2 || (rx_stream == 3 && stream_generated % 2)) {
+            const uint8_t empty[8] = {2, 0, 9, 0x10};
+            queue_status(empty);
+        } else mock_rx_record(extra_data, 6, 2);
+    }
     if (chunk && n > chunk) n = chunk;
     int r = scripted_base_read(io, buf, n, timeout_ms);
+    if (r > 0) {
+        ++immediate_reads;
+        clock_ns += immediate_ns;
+    }
     if (!r && read_wait) clock_ns += (uint64_t)timeout_ms * 1000000;
     return r;
 }
@@ -101,6 +118,8 @@ static PASSTHRU_MSG messages[3], received[20];
 static void start(void)
 {
     reject_op = drop_op = -1;
+    rx_stream = stream_generated = immediate_reads = max_read_timeout = 0;
+    immediate_ns = 0;
     lock_busy = init_success = 0;
     reject_at = op_calls = lost = chunk = tx_delay = read_wait = async_count = bad_poll = 0;
     assert(PassThruOpen((void *)"script-only", &device) == 0);
@@ -277,6 +296,102 @@ static void test_fragments_bounds_and_overflow(void)
     stop();
     puts("PASS: fragmented input, full admitted async capacity, explicit bounded-queue loss and oversize refusal");
 }
+
+static void loopback_off(void)
+{
+    SCONFIG one = {LOOPBACK, 0};
+    SCONFIG_LIST list = {1, &one};
+    assert(PassThruIoctl(channel, SET_CONFIG, &list, NULL) == 0);
+}
+
+static void test_bounded_nonblocking_stream(void)
+{
+    /* Echoes, empty statuses, and their mixture all use one public budget.
+     * There is no I/O error or empty transport read to terminate these calls. */
+    for (int stream = 1; stream <= 3; ++stream) {
+        start(); loopback_off();
+        rx_stream = stream;
+        max_read_timeout = 0;
+        immediate_ns = 1000000;
+        int before = mock_frame_count();
+        J2534_ULONG n = 1;
+        assert(PassThruReadMsgs(channel, received, &n, 0) == ERR_BUFFER_EMPTY && n == 0);
+        assert(stream_generated > 0 && stream_generated <= (int)MVCI_PIPE_READ_BUDGET);
+        assert(max_read_timeout == 0 && mock_frame_count() == before);
+        rx_stream = 0; immediate_ns = 0;
+        mock_rx_record(extra_data, 5, 0); n = 1;
+        assert(PassThruReadMsgs(channel, received, &n, 0) == 0 && n == 1);
+        assert(config() == 0); /* Valid traffic never poisons command correlation. */
+        stop();
+    }
+
+    start(); loopback_off();
+    const uint8_t first[] = {0x48, 1}, last[] = {0x48, 2};
+    mock_rx_record(first, sizeof first, 0);
+    for (unsigned i = 1; i < MVCI_PIPE_READ_BUDGET; ++i) {
+        if (i % 2) mock_rx_record(extra_data, 6, 2);
+        else {
+            const uint8_t empty[8] = {2, 0, 9, 0x10};
+            queue_status(empty);
+        }
+    }
+    mock_rx_record(last, sizeof last, 0);
+    J2534_ULONG n = 2;
+    assert(PassThruReadMsgs(channel, received, &n, 0) == 0 && n == 1);
+    assert(received[0].DataSize == sizeof first && memcmp(received[0].Data, first, sizeof first) == 0);
+    n = 1;
+    assert(PassThruReadMsgs(channel, received, &n, 0) == 0 && n == 1);
+    assert(received[0].DataSize == sizeof last && memcmp(received[0].Data, last, sizeof last) == 0);
+    n = 1;
+    assert(PassThruReadMsgs(channel, received, &n, 0) == ERR_BUFFER_EMPTY && n == 0);
+    stop();
+    puts("PASS: bounded zero-timeout echo/status streams, partial counts and unconsumed record retention");
+}
+
+static void test_immediate_read_deadline(void)
+{
+    const uint8_t first[] = {0x48, 0x6b, 0x10, 0x41, 1};
+    const uint8_t second[] = {0x48, 0x6b, 0x10, 0x41, 2};
+    /* Expire after only the frame length, then after the complete wire body.
+     * Both must retain bytes and deliver the same frame once on the next call. */
+    for (int timeout = 1; timeout <= 3; timeout += 2) {
+        start();
+        mock_rx_record(first, sizeof first, 0);
+        mock_rx_record(second, sizeof second, 0);
+        immediate_ns = 2000000;
+        immediate_reads = max_read_timeout = 0;
+        int before = mock_frame_count();
+        uint64_t began = clock_ns;
+        memset(received, 0xa5, sizeof received);
+        PASSTHRU_MSG unchanged = received[0];
+        J2534_ULONG n = 1;
+        assert(PassThruReadMsgs(channel, received, &n, timeout) == ERR_TIMEOUT && n == 0);
+        assert(clock_ns - began == (uint64_t)(timeout + 1) * 1000000);
+        assert(immediate_reads == (timeout + 1) / 2 && max_read_timeout == 0);
+        assert(mock_frame_count() == before && memcmp(received, &unchanged, sizeof unchanged) == 0);
+        immediate_ns = 0; n = 2;
+        assert(PassThruReadMsgs(channel, received, &n, 0) == 0 && n == 2);
+        assert(received[0].DataSize == sizeof first && memcmp(received[0].Data, first, sizeof first) == 0);
+        assert(received[1].DataSize == sizeof second && memcmp(received[1].Data, second, sizeof second) == 0);
+        n = 1;
+        assert(PassThruReadMsgs(channel, received, &n, 0) == ERR_BUFFER_EMPTY && n == 0);
+        assert(config() == 0);
+        stop();
+    }
+
+    start();
+    mock_rx_record(first, sizeof first, 0);
+    mock_rx_record(second, sizeof second, 0);
+    immediate_ns = 250000;
+    J2534_ULONG n = 2;
+    assert(PassThruReadMsgs(channel, received, &n, 1) == ERR_TIMEOUT && n == 1);
+    assert(received[0].DataSize == sizeof first && memcmp(received[0].Data, first, sizeof first) == 0);
+    immediate_ns = 0; n = 1;
+    assert(PassThruReadMsgs(channel, received, &n, 0) == 0 && n == 1);
+    assert(received[0].DataSize == sizeof second && memcmp(received[0].Data, second, sizeof second) == 0);
+    stop();
+    puts("PASS: one caller deadline covers immediate I/O; late complete/partial records survive without false counts");
+}
 static void test_lock_deadline(void)
 {
     start(); lock_busy = 1;
@@ -298,6 +413,8 @@ int main(void)
     test_write_batch_and_deadline();
     test_read_deadlines_and_errors();
     test_fragments_bounds_and_overflow();
+    test_bounded_nonblocking_stream();
+    test_immediate_read_deadline();
     test_lock_deadline();
     puts("pipeline: all checks passed; skips=0 (offline only)");
     return 0;
