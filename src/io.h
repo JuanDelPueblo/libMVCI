@@ -32,7 +32,10 @@ int mvci_io_write_timeout(mvci_io_t *io, const uint8_t *buf, int n, int timeout_
  * timeout_ms=0 returns only bytes already queued and never waits; < 0 is -1. */
 int  mvci_io_read(mvci_io_t *io, uint8_t *buf, int n, int timeout_ms);
 
-/* discard any buffered input */
+/* Host input purge only; never a cable mailbox or ACK recovery boundary.
+ * The checked call returns 0/-1. A failed purge blocks transport I/O until
+ * a later successful purge. The void form is retained for existing callers. */
+int mvci_io_purge_rx_checked(mvci_io_t *io);
 void mvci_io_purge_rx(mvci_io_t *io);
 
 #endif /* MVCI_IO_H */

@@ -43,6 +43,8 @@ static int g_five_baud_success;
 static int g_fast_reply_len;
 static int g_fast_reply_enabled;
 static int g_handshake_shape;
+static int g_purge_failure;
+void mock_purge_failure(int enabled) { g_purge_failure = enabled; }
 void mock_handshake_shape(int mode) { g_handshake_shape = mode; }
 
 void mock_async_reply(int mode) { g_async_reply = mode; }
@@ -243,6 +245,7 @@ static void on_frame(const uint8_t *f, int n)
 mvci_io_t *mvci_io_open(const char *port)
 {
     (void)port;
+    g_purge_failure = 0;
     g_nwritten = 0;
     g_asmlen = 0;
     g_qhead = g_qtail = 0;
@@ -301,4 +304,11 @@ int mvci_io_write_timeout(mvci_io_t *io, const uint8_t *buf, int n, int timeout_
 {
     (void)timeout_ms;
     return mvci_io_write(io, buf, n);
+}
+
+int mvci_io_purge_rx_checked(mvci_io_t *io)
+{
+    if (g_purge_failure) return -1;
+    mvci_io_purge_rx(io);
+    return 0;
 }

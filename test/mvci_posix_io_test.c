@@ -10,7 +10,7 @@
 #include <stdio.h>
 
 static uint64_t clock_ns;
-static int mode, polls, writes, reads, closes, setup_fail;
+static int mode, polls, writes, reads, closes, setup_fail, purge_fail;
 static short events;
 enum { READY, INTERRUPT, TIMEOUT, HANGUP, ZERO, PARTIAL, WOULD_BLOCK };
 int __wrap_clock_gettime(clockid_t id, struct timespec *t)
@@ -33,7 +33,7 @@ int __wrap_tcsetattr(int fd, int action, const struct termios *t)
     assert(fd == 123 && action == TCSANOW && t->c_cc[VMIN] == 1);
     return setup_fail ? -1 : 0;
 }
-int __wrap_tcflush(int fd, int action) { assert(fd == 123); (void)action; return 0; }
+int __wrap_tcflush(int fd, int action) { assert(fd == 123); (void)action; if (purge_fail) { errno = EIO; return -1; } return 0; }
 int __wrap_ioctl(int fd, unsigned long op, ...)
 {
     assert(fd == 123);
@@ -79,7 +79,7 @@ static void reset(int next)
 }
 int main(void)
 {
-    struct mvci_io io = {123}; uint8_t bytes[8] = {0};
+    struct mvci_io io = {.fd = 123}; uint8_t bytes[8] = {0};
     reset(READY);
     assert(mvci_io_write_timeout(&io, bytes, 8, 0) == 8 && polls == 1 && clock_ns == 0);
     assert(mvci_io_read(&io, bytes, 8, 0) == 8 && clock_ns == 0);
@@ -99,11 +99,19 @@ int main(void)
     assert(mvci_io_write_timeout(&io, bytes, 8, 11) == -1 && writes == 0);
     reset(TIMEOUT);
     assert(mvci_io_read(&io, bytes, 8, 0) == 0 && clock_ns == 0);
+    reset(READY);
+    purge_fail = 1;
+    assert(mvci_io_purge_rx_checked(&io) == -1);
+    assert(mvci_io_read(&io, bytes, 8, 0) == -1 && polls == 0);
+    assert(mvci_io_write_timeout(&io, bytes, 8, 10) == -1 && polls == 0);
+    purge_fail = 0;
+    assert(mvci_io_purge_rx_checked(&io) == 0);
+    assert(mvci_io_read(&io, bytes, 8, 0) == 8);
     setup_fail = 1;
     assert(mvci_io_open("script-only") == NULL && closes == 1);
     setup_fail = 0;
     mvci_io_t *opened = mvci_io_open("script-only");
     assert(opened); mvci_io_close(opened); assert(closes == 2);
-    puts("POSIX scripted I/O: deadline, zero timeout, EINTR, partial I/O, EOF, zero write, HUP and setup errors passed; skips=0");
+    puts("POSIX scripted I/O: deadline, zero timeout, EINTR, partial I/O, EOF, zero write, HUP, purge and setup errors passed; skips=0");
     return 0;
 }

@@ -198,9 +198,15 @@ int mvci_io_read(mvci_io_t *io, uint8_t *buf, int n, int timeout_ms)
     return got <= (DWORD)n ? (int)got : -1;     /* got < n is a timeout */
 }
 
+int mvci_io_purge_rx_checked(mvci_io_t *io)
+{
+    if (!io) return -1;
+    io->purge_failed = (FT.Purge(io->h, FT_PURGE_RX) != FT_OK);
+    return io->purge_failed ? -1 : 0;
+}
 void mvci_io_purge_rx(mvci_io_t *io)
 {
-    if (io) io->purge_failed = (FT.Purge(io->h, FT_PURGE_RX) != FT_OK);
+    (void)mvci_io_purge_rx_checked(io);
 }
 
 /* ====================================================================== */
@@ -213,7 +219,7 @@ void mvci_io_purge_rx(mvci_io_t *io)
 #include <unistd.h>
 #include <poll.h>
 
-struct mvci_io { int fd; };
+struct mvci_io { int fd; int purge_failed; };
 
 mvci_io_t *mvci_io_open(const char *port)
 {
@@ -275,7 +281,7 @@ static int wait_ready(mvci_io_t *io, short events, uint32_t deadline)
 
 int mvci_io_write_timeout(mvci_io_t *io, const uint8_t *buf, int n, int timeout_ms)
 {
-    if (!io || !buf || n < 0 || timeout_ms < 0) return -1;
+    if (!io || !buf || n < 0 || timeout_ms < 0 || io->purge_failed) return -1;
     uint32_t deadline = mvci_now_ms() + (uint32_t)timeout_ms;
     int off = 0;
     while (off < n) {
@@ -303,7 +309,7 @@ int mvci_io_write(mvci_io_t *io, const uint8_t *buf, int n)
 
 int mvci_io_read(mvci_io_t *io, uint8_t *buf, int n, int timeout_ms)
 {
-    if (!io || !buf || n < 0 || timeout_ms < 0) return -1;
+    if (!io || !buf || n < 0 || timeout_ms < 0 || io->purge_failed) return -1;
     uint32_t deadline = mvci_now_ms() + (uint32_t)timeout_ms;
     int got = 0;
     while (got < n) {
@@ -322,9 +328,15 @@ int mvci_io_read(mvci_io_t *io, uint8_t *buf, int n, int timeout_ms)
     return got;
 }
 
+int mvci_io_purge_rx_checked(mvci_io_t *io)
+{
+    if (!io) return -1;
+    io->purge_failed = tcflush(io->fd, TCIFLUSH) != 0;
+    return io->purge_failed ? -1 : 0;
+}
 void mvci_io_purge_rx(mvci_io_t *io)
 {
-    tcflush(io->fd, TCIFLUSH);
+    (void)mvci_io_purge_rx_checked(io);
 }
 
 #endif

@@ -28,12 +28,14 @@ int __wrap_nanosleep(const struct timespec *t, struct timespec *remaining)
 #define mvci_io_write_timeout scripted_write_timeout
 #define mvci_io_write scripted_write
 #define mvci_io_read scripted_read
+#define mvci_io_purge_rx_checked scripted_purge_checked
 #define mvci_io_purge_rx scripted_purge
 #include "mock_io.c"
 #undef mvci_io_write
 #undef mvci_io_write_timeout
 #undef mvci_io_read
 #undef mvci_io_purge_rx
+#undef mvci_io_purge_rx_checked
 
 static uint8_t fail_opcode;
 static int fail_as_reply;
@@ -67,6 +69,12 @@ void mvci_io_purge_rx(mvci_io_t *io)
 {
     purges++;
     scripted_purge(io);
+}
+
+int mvci_io_purge_rx_checked(mvci_io_t *io)
+{
+    purges++;
+    return scripted_purge_checked(io);
 }
 
 static unsigned checks, failures;
@@ -302,6 +310,21 @@ static void test_rx_tx_and_periodic_clear(void)
     fail_as_reply = 1;
     fail_opcode = 0x0e; fail_after = 1;
     CHECK(PassThruIoctl(ch, CLEAR_PERIODIC_MSGS, NULL, NULL) == ERR_FAILED);
+    /* A failed purge must neither claim success nor deliver the retained
+     * host queue or unpurged serial tail. A successful retry clears both. */
+    mock_rx_record(payload, sizeof payload, 0);
+    CHECK(PassThruIoctl(ch, SET_CONFIG, &list, NULL) == STATUS_NOERROR);
+    mock_rx_record(payload, sizeof payload, 0);
+    mock_purge_failure(1);
+    before = mock_frame_count();
+    CHECK(PassThruIoctl(ch, CLEAR_RX_BUFFER, NULL, NULL) == ERR_FAILED);
+    n = 1;
+    CHECK(PassThruReadMsgs(ch, &msg, &n, 0) == ERR_DEVICE_NOT_CONNECTED && n == 0);
+    CHECK(mock_frame_count() == before);
+    mock_purge_failure(0);
+    CHECK(PassThruIoctl(ch, CLEAR_RX_BUFFER, NULL, NULL) == STATUS_NOERROR);
+    n = 1;
+    CHECK(PassThruReadMsgs(ch, &msg, &n, 0) == ERR_BUFFER_EMPTY && n == 0);
     /* Timing read-back must remain unsupported even after an ACKed SET. */
     config.Value = 0xdeadbeef;
     before = mock_frame_count();

@@ -253,6 +253,7 @@ struct mvci_ctx {
     int              rx_used;
     int              poisoned; /* Unknown outstanding result: close/reopen required. */
     int              overflow;
+    int              rx_purge_failed;
     mvci_mutex_t     lock;       /* serialises device I/O */
     mvci_thread_t    ka_thread;
     volatile int     ka_run;
@@ -396,10 +397,10 @@ static int do_handshake(mvci_ctx_t *ctx)
     ctx->rx_used = 0;
     ctx->pending_count = 0;
     n = mvci_frame_plain(NULL, 0, frame, sizeof frame);     /* reset */
-    mvci_io_purge_rx(ctx->io);
+    if (mvci_io_purge_rx_checked(ctx->io) != 0) return -1;
     if (mvci_io_write(ctx->io, frame, n) != n) return -1;
     mvci_sleep_ms(110);
-    mvci_io_purge_rx(ctx->io);
+    if (mvci_io_purge_rx_checked(ctx->io) != 0) return -1;
 
     static const uint8_t ident[] = { 0x07, 0x00, 0x01, 'M', 'V', 'C', 'I', '-', 'T' };
     n = mvci_frame_plain(ident, sizeof ident, frame, sizeof frame);
@@ -448,6 +449,7 @@ static int lock_until(mvci_ctx_t *ctx, uint32_t deadline, int may_wait)
 static int transact_locked(mvci_ctx_t *ctx, const uint8_t *inner, size_t inner_len,
                            uint8_t *resp_inner, size_t resp_cap, int timeout_ms)
 {
+    if (ctx->rx_purge_failed) return MVCI_PIPE_IO;
     if (ctx->poisoned) return MVCI_PIPE_DESYNC;
     if (timeout_ms <= 0) return MVCI_PIPE_TIMEOUT;
     uint32_t deadline = mvci_now_ms() + (uint32_t)timeout_ms;
@@ -588,7 +590,10 @@ int mvci_disconnect(mvci_ctx_t *ctx)
     int n = mvci_frame_enc(ctx->key, in, sizeof in, frame, sizeof frame);
     if (!ctx->have_key || n < 0) return -1;
     mvci_mutex_lock(&ctx->lock);
-    mvci_io_purge_rx(ctx->io);
+    if (mvci_io_purge_rx_checked(ctx->io) != 0) {
+        mvci_mutex_unlock(&ctx->lock);
+        return -1;
+    }
     int ok = -1;
     if (mvci_io_write(ctx->io, frame, n) == n) {
         int got = 0;
@@ -711,7 +716,9 @@ int mvci_poll(mvci_ctx_t *ctx, uint8_t *msg_out, size_t cap,
     uint32_t deadline = mvci_now_ms() + (uint32_t)timeout_ms;
     if (!lock_until(ctx, deadline, timeout_ms > 0)) return MVCI_PIPE_TIMEOUT;
     int r;
-    if (ctx->overflow) {
+    if (ctx->rx_purge_failed) {
+        r = MVCI_PIPE_IO;
+    } else if (ctx->overflow) {
         ctx->overflow = 0;
         r = MVCI_PIPE_OVERFLOW;
     } else if (ctx->pending_count) {
@@ -749,10 +756,15 @@ int mvci_clear_rx_buffer(mvci_ctx_t *ctx)
 {
     if (!ctx || !ctx->have_key) return -1;
     mvci_mutex_lock(&ctx->lock);
+    if (mvci_io_purge_rx_checked(ctx->io) != 0) {
+        ctx->rx_purge_failed = 1;
+        mvci_mutex_unlock(&ctx->lock);
+        return -1;
+    }
+    ctx->rx_purge_failed = 0;
     ctx->pending_count = 0;
     ctx->rx_used = 0;
     ctx->overflow = 0;
-    mvci_io_purge_rx(ctx->io);
     /* Clearing host RX is not an ACK/session recovery boundary. */
     mvci_mutex_unlock(&ctx->lock);
     return 0;
