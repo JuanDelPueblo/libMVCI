@@ -38,9 +38,11 @@ static int g_qhead, g_qtail;
 static int g_async_reply;
 static uint32_t g_protocol;
 static int g_poll_reply, g_device_reply_pending;
+static uint8_t g_config_status;
 
 void mock_async_reply(int mode) { g_async_reply = mode; }
 void mock_poll_reply(void) { g_poll_reply = 1; }
+void mock_config_status(uint8_t status) { g_config_status = status; }
 
 const uint8_t *mock_key(void) { return MOCK_KEY; }
 
@@ -78,6 +80,18 @@ static void queue_pid03_reply(void)
     };
     uint8_t frame[MVCI_MAX_FRAME];
     int n = mvci_frame_enc(MOCK_KEY, msg, sizeof msg, frame, sizeof frame);
+    if (n > 0) queue_bytes(frame, n);
+}
+
+void mock_rx_record(const uint8_t *data, int len, uint8_t status)
+{
+    uint8_t inner[80] = {0}, frame[MVCI_MAX_FRAME];
+    if (len <= 0 || len > 64) return;
+    inner[0] = (uint8_t)(len + 9);
+    inner[2] = 0x09;
+    inner[3] = status;
+    memcpy(inner + 11, data, (size_t)len);
+    int n = mvci_frame_enc(MOCK_KEY, inner, (size_t)(len + 11), frame, sizeof frame);
     if (n > 0) queue_bytes(frame, n);
 }
 
@@ -145,6 +159,8 @@ static void answer(const uint8_t *inner, int ilen)
     } else if (ilen >= 4 && inner[2] == 0x0e) {
         static const uint8_t r[8] = { 0x02, 0x00, 0x0e, 0x00, 0x00, 0x00, 0x00, 0x00 };
         memcpy(st, r, 8);
+        st[3] = g_config_status;
+        g_config_status = 0;
     } else if (ilen >= 4 && inner[2] == 0x02) {
         /* Disconnect: the real device answers in plaintext (T255 frame 560). */
         static const uint8_t pl[4] = { 0x02, 0x00, 0x02, 0x00 };
@@ -196,6 +212,7 @@ mvci_io_t *mvci_io_open(const char *port)
     g_asmlen = 0;
     g_qhead = g_qtail = 0;
     g_async_reply = 0;
+    g_config_status = 0;
     g_protocol = 0;
     g_poll_reply = g_device_reply_pending = 0;
     return &g_io;

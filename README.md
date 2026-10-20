@@ -44,6 +44,10 @@ same wire protocol.
   valid RPM/TPS samples with zero errors. Read polls use the connected
   ProtocolID. Offline receive tests cover queued replies around write ACKs.
 - ⬜ **ISO15765 / CAN** — not yet implemented. CAN ECUs are not yet reachable.
+- **Configuration read-back** — `GET_CONFIG` reports only the host-enforced
+  `LOOPBACK` delivery policy. Cable timing parameters return `ERR_NOT_SUPPORTED`,
+  even after a successful `SET_CONFIG`. A cable ACK does not prove that its
+  firmware applies the requested timing. See [configuration limits](docs/PROTOCOL.md#configuration-read-back).
 - The wire framing (DES‑based) and session handling are fully implemented and
   identical across all platforms; only the protocol/transport/crypto *backends*
   differ per OS, selected at compile time.

@@ -39,6 +39,7 @@ typedef struct {
     int          connected;
     mvci_ctx_t  *ctx;
     uint32_t     proto;
+    uint32_t     loopback;       /* host delivery policy, not a cable read-back */
     uint32_t     next_id;        /* filter/msg id generator */
     uint32_t     filter_msg[MAX_FILTERS];  /* device msgid by (FilterID-1), 0 = free */
 } slot_t;
@@ -156,6 +157,8 @@ J2534_LONG J2534_API PassThruConnect(J2534_ULONG DeviceID, J2534_ULONG ProtocolI
     }
     s->connected = 1;
     s->proto = ProtocolID;
+    /* Preserve the historical delivery of device echoes on a new channel. */
+    s->loopback = 1;
     *pChannelID = CH_ID(SLOT_FROM_DEV(DeviceID));
     return STATUS_NOERROR;
 }
@@ -251,6 +254,12 @@ J2534_LONG J2534_API PassThruReadMsgs(J2534_ULONG ChannelID, PASSTHRU_MSG *pMsg,
         uint8_t buf[64], rx = 0;
         int m = mvci_poll(s->ctx, buf, sizeof buf, &rx, 200);
         if (m > 0) {
+            /* Device status 2 is an echo, except the captured one-byte 48
+             * START_OF_MESSAGE prefix. Never suppress that receive marker. */
+            if (!s->loopback && rx == 2 && !(m == 1 && buf[0] == 0x48)) {
+                if ((int32_t)(deadline - mvci_now_ms()) <= 0) break;
+                continue;
+            }
             PASSTHRU_MSG *o = &pMsg[got];
             memset(o, 0, sizeof *o);
             o->ProtocolID = s->proto;
@@ -277,15 +286,53 @@ J2534_LONG J2534_API PassThruIoctl(J2534_ULONG ChannelID, J2534_ULONG IoctlID,
     if (!s) { set_err("invalid channel id"); return ERR_INVALID_CHANNEL_ID; }
 
     switch (IoctlID) {
+    case GET_CONFIG: {
+        SCONFIG_LIST *list = (SCONFIG_LIST *)pInput;
+        if (!s->connected) return ERR_INVALID_CHANNEL_ID;
+        if (!list || (list->NumOfParams && !list->ConfigPtr)) return ERR_NULL_PARAMETER;
+        /* There is no evidenced cable GET command. A SET acknowledgement is
+         * not proof that firmware applied a timing parameter. Only report the
+         * LOOPBACK policy enforced by this driver's read path. Validate the
+         * whole list before changing any caller-owned value. */
+        for (uint32_t i = 0; i < list->NumOfParams; i++) {
+            uint32_t param = list->ConfigPtr[i].Parameter;
+            if (param != LOOPBACK) {
+                const char *name = param == P1_MAX ? "P1_MAX" :
+                                   param == P3_MIN ? "P3_MIN" :
+                                   param == P4_MIN ? "P4_MIN" :
+                                   param == DATA_RATE ? "DATA_RATE" : "parameter";
+                snprintf(g_last_error, sizeof g_last_error,
+                         "GET_CONFIG %s (0x%08x): applied cable value is unknown",
+                         name, (unsigned)param);
+                return ERR_NOT_SUPPORTED;
+            }
+        }
+        for (uint32_t i = 0; i < list->NumOfParams; i++)
+            list->ConfigPtr[i].Value = s->loopback;
+        return STATUS_NOERROR;
+    }
     case SET_CONFIG: {
         SCONFIG_LIST *list = (SCONFIG_LIST *)pInput;
+        if (!s->connected) return ERR_INVALID_CHANNEL_ID;
         if (!list || (list->NumOfParams && !list->ConfigPtr)) return ERR_NULL_PARAMETER;
         for (uint32_t i = 0; i < list->NumOfParams; i++)
+            if (list->ConfigPtr[i].Parameter == LOOPBACK && list->ConfigPtr[i].Value > 1) {
+                set_err("LOOPBACK must be 0 or 1");
+                return ERR_INVALID_IOCTL_VALUE;
+            }
+        for (uint32_t i = 0; i < list->NumOfParams; i++) {
+            if (list->ConfigPtr[i].Parameter == LOOPBACK) {
+                /* Forward real device echoes when enabled; never synthesize
+                 * one from the requested TX bytes. No cable command needed. */
+                s->loopback = list->ConfigPtr[i].Value;
+                continue;
+            }
             if (mvci_set_config(s->ctx, list->ConfigPtr[i].Parameter,
                                 list->ConfigPtr[i].Value) != 0) {
                 set_err("set_config failed");
                 return ERR_FAILED;
             }
+        }
         return STATUS_NOERROR;
     }
     case CLEAR_PERIODIC_MSGS:

@@ -23,6 +23,8 @@ int mock_frame_count(void);
 int mock_frame_bytes(int idx, uint8_t *out, int cap);
 void mock_async_reply(int mode);
 void mock_poll_reply(void);
+void mock_config_status(uint8_t status);
+void mock_rx_record(const uint8_t *data, int len, uint8_t status);
 
 static int g_pass, g_fail;
 
@@ -356,6 +358,93 @@ static void test_poll_connected_protocol(void)
     }
 }
 
+static void test_truthful_config(void)
+{
+    puts("--- GET_CONFIG reports only host-enforced LOOPBACK ---");
+    J2534_ULONG dev = open_dev();
+    J2534_ULONG ch = connect_ch(dev, 0);
+    SCONFIG cfg[] = {{LOOPBACK, 99}, {P1_MAX, 99}};
+    SCONFIG_LIST list = {1, cfg};
+    int before = mock_frame_count();
+    ok(PassThruIoctl(ch, GET_CONFIG, NULL, NULL) == ERR_NULL_PARAMETER,
+       "GET_CONFIG rejects NULL list");
+    SCONFIG_LIST bad = {1, NULL}, empty = {0, NULL};
+    ok(PassThruIoctl(ch, GET_CONFIG, &bad, NULL) == ERR_NULL_PARAMETER,
+       "GET_CONFIG rejects NULL parameter array");
+    ok(PassThruIoctl(ch, GET_CONFIG, &empty, NULL) == STATUS_NOERROR,
+       "empty GET_CONFIG succeeds");
+    ok(PassThruIoctl(ch, GET_CONFIG, &list, NULL) == STATUS_NOERROR && cfg[0].Value == 1,
+       "new channel preserves enabled loopback delivery");
+    cfg[0].Value = 99;
+    list.NumOfParams = 2;
+    ok(PassThruIoctl(ch, GET_CONFIG, &list, NULL) == ERR_NOT_SUPPORTED
+       && cfg[0].Value == 99 && cfg[1].Value == 99,
+       "mixed GET_CONFIG refuses atomically without inventing a timing value");
+    char error[128];
+    PassThruGetLastError(error);
+    ok(strstr(error, "P1_MAX") != NULL, "GET_CONFIG names the unreportable parameter");
+    ok(mock_frame_count() == before, "GET_CONFIG emits no guessed cable command");
+
+    static const uint32_t params[] = {P1_MAX, P3_MIN, P4_MIN, DATA_RATE, 0xdeadbeef};
+    for (unsigned i = 0; i < sizeof params / sizeof params[0]; i++) {
+        ok(set_one(ch, params[i], 16) == STATUS_NOERROR, "SET_CONFIG can receive a success ACK");
+        SCONFIG sc = {params[i], 99};
+        SCONFIG_LIST sl = {1, &sc};
+        before = mock_frame_count();
+        ok(PassThruIoctl(ch, GET_CONFIG, &sl, NULL) == ERR_NOT_SUPPORTED && sc.Value == 99,
+           "SET acknowledgement does not become an applied-value read-back");
+        ok(mock_frame_count() == before, "unreportable GET_CONFIG sends no traffic");
+    }
+    mock_config_status(8);
+    ok(set_one(ch, P4_MIN, 4) == ERR_FAILED, "nonzero SET_CONFIG cable status is refused");
+    ok(set_one(ch, LOOPBACK, 0) == STATUS_NOERROR, "disable loopback locally");
+    ok(set_one(ch, LOOPBACK, 2) == ERR_INVALID_IOCTL_VALUE,
+       "invalid loopback value is refused");
+    list.NumOfParams = 1;
+    ok(PassThruIoctl(ch, GET_CONFIG, &list, NULL) == STATUS_NOERROR && cfg[0].Value == 0,
+       "failed loopback change preserves the actual host policy");
+    ok(PassThruDisconnect(ch) == STATUS_NOERROR, "config test disconnect");
+    ok(PassThruIoctl(ch, GET_CONFIG, &list, NULL) == ERR_INVALID_CHANNEL_ID,
+       "GET_CONFIG rejects disconnected channel");
+    ok(set_one(ch, LOOPBACK, 1) == ERR_INVALID_CHANNEL_ID,
+       "SET_CONFIG rejects disconnected channel");
+    ch = connect_ch(dev, 0);
+    ok(ch != 0 && PassThruIoctl(ch, GET_CONFIG, &list, NULL) == STATUS_NOERROR && cfg[0].Value == 1,
+       "reconnect resets channel loopback policy");
+    ok(PassThruClose(dev) == STATUS_NOERROR, "config test close");
+}
+
+static void test_loopback_delivery(void)
+{
+    puts("--- LOOPBACK controls real echoes and preserves receive prefixes ---");
+    J2534_ULONG dev = open_dev();
+    J2534_ULONG ch = connect_ch(dev, 0);
+    static const uint8_t echo[] = {0x68,0x6a,0xf1,0xa3,0x66};
+    static const uint8_t prefix[] = {0x48};
+    static const uint8_t reply[] = {0x48,0x6b,0x10,0xe3,0xa6};
+    int before = mock_frame_count();
+    ok(set_one(ch, LOOPBACK, 0) == STATUS_NOERROR && mock_frame_count() == before,
+       "host LOOPBACK setting needs no firmware command");
+    mock_rx_record(echo, sizeof echo, 2);
+    mock_rx_record(prefix, sizeof prefix, 2);
+    mock_rx_record(reply, sizeof reply, 0);
+    PASSTHRU_MSG rx[2];
+    J2534_ULONG count = 2;
+    ok(PassThruReadMsgs(ch, rx, &count, 20) == STATUS_NOERROR && count == 2
+       && rx[0].RxStatus == 2 && rx[0].DataSize == 1 && rx[0].Data[0] == 0x48
+       && rx[1].RxStatus == 0 && rx[1].DataSize == sizeof reply
+       && memcmp(rx[1].Data, reply, sizeof reply) == 0,
+       "disabled loopback drops echo but preserves prefix and ECU frame");
+    ok(set_one(ch, LOOPBACK, 1) == STATUS_NOERROR, "enable delivery of real device echoes");
+    mock_rx_record(echo, sizeof echo, 2);
+    count = 1;
+    ok(PassThruReadMsgs(ch, rx, &count, 20) == STATUS_NOERROR && count == 1
+       && rx[0].RxStatus == 2 && rx[0].DataSize == sizeof echo
+       && memcmp(rx[0].Data, echo, sizeof echo) == 0,
+       "enabled loopback delivers the device bytes unchanged");
+    ok(PassThruClose(dev) == STATUS_NOERROR, "loopback test close");
+}
+
 int main(void)
 {
     puts("=== seq-test (mock device, exact wire sequences) ===");
@@ -364,6 +453,8 @@ int main(void)
     test_oversize_public_path();
     test_queued_diagnostic_reply();
     test_poll_connected_protocol();
+    test_truthful_config();
+    test_loopback_delivery();
     printf("\nseq-test: %d passed, %d failed\n\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }
