@@ -403,6 +403,66 @@ static void test_pending_poll_across_public_deadlines(void)
     stop();
     puts("PASS: delayed and split poll replies retain ordering; missing reply poisons after age cap");
 }
+static void test_pending_poll_age_boundary(void)
+{
+    /* The reply is ready during application idle. Resolve it before testing
+     * the send age, for both command and read callers. */
+    for (int mode = 0; mode < 3; ++mode) {
+        start(); delayed_poll_num = 1; delayed_poll_ms = 10;
+        delayed_data = mode == 0; read_wait = 1;
+        J2534_ULONG n = 1;
+        assert(PassThruReadMsgs(channel, received, &n, 5) == ERR_TIMEOUT && n == 0);
+        int before = mock_frame_count();
+        clock_ns += 1500000000;
+        if (mode == 0) {
+            n = 1;
+            assert(PassThruReadMsgs(channel, received, &n, 0) == 0 && n == 1);
+            assert(received[0].DataSize == 5 && mock_frame_count() == before);
+        } else if (mode == 1) {
+            n = 1;
+            assert(PassThruReadMsgs(channel, received, &n, 0) == ERR_BUFFER_EMPTY && n == 0);
+            assert(mock_frame_count() == before);
+        } else {
+            n = 1;
+            assert(PassThruWriteMsgs(channel, messages, &n, 50) == 0 && n == 1);
+            assert(mock_frame_count() == before + 1);
+        }
+        stop();
+    }
+
+    /* All bytes can be buffered even when the first transport read returns
+     * only one byte. The non-waiting probe must finish that frame. */
+    start(); delayed_poll_num = 1; delayed_poll_ms = 10;
+    delayed_data = 1; read_wait = 1;
+    J2534_ULONG n = 1;
+    assert(PassThruReadMsgs(channel, received, &n, 5) == ERR_TIMEOUT && n == 0);
+    assert(delayed_len > 0);
+    queue_bytes(delayed_frame, delayed_len);
+    delayed_len = delayed_pos = 0;
+    chunk = 1;
+    int before = mock_frame_count();
+    clock_ns += 1500000000;
+    n = 1;
+    assert(PassThruReadMsgs(channel, received, &n, 0) == 0 && n == 1);
+    assert(received[0].DataSize == 5 && mock_frame_count() == before);
+    stop();
+
+    /* A missing reply consumes only the poll's remaining age, even when the
+     * read caller grants far more time. No second poll may be sent. */
+    start(); poll_missing_after = 1; read_wait = 1;
+    n = 1;
+    assert(PassThruReadMsgs(channel, received, &n, 5) == ERR_TIMEOUT && n == 0);
+    before = mock_frame_count();
+    uint64_t began = clock_ns;
+    n = 1;
+    assert(PassThruReadMsgs(channel, received, &n, 5000) == ERR_FAILED && n == 0);
+    assert(clock_ns - began == 996000000 && mock_frame_count() == before);
+    n = 1;
+    assert(PassThruWriteMsgs(channel, messages, &n, 20) == ERR_FAILED && n == 0);
+    assert(mock_frame_count() == before);
+    stop();
+    puts("PASS: buffered aged replies survive idle; missing polls stop at the age bound");
+}
 static void test_fragments_bounds_and_overflow(void)
 {
     start(); chunk = 1;
@@ -551,6 +611,7 @@ int main(void)
     test_write_batch_and_deadline();
     test_read_deadlines_and_errors();
     test_pending_poll_across_public_deadlines();
+    test_pending_poll_age_boundary();
     test_fragments_bounds_and_overflow();
     test_bounded_nonblocking_stream();
     test_immediate_read_deadline();

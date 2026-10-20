@@ -436,39 +436,53 @@ static int queue_record(mvci_ctx_t *ctx, const uint8_t *inner, int r)
     return 0;
 }
 
-/* Resolve the one tracked poll before sending or purging anything else.
- * A caller deadline can expire without losing correlation. A truly missing
- * reply eventually poisons the session independently of short read budgets. */
-static int resolve_poll_until(mvci_ctx_t *ctx, uint32_t deadline)
+/* A pending poll owns the next record. Drain available bytes, including a
+ * buffered fragment, before applying either deadline. A complete reply is
+ * valid even when the host has been idle past the conservative age bound. */
+static int receive_pending_poll_until(mvci_ctx_t *ctx, uint8_t *inner,
+                                      uint32_t deadline, int timed,
+                                      int probe_first)
 {
-    uint8_t inner[MVCI_MAX_INNER];
     while (ctx->poll_pending) {
+        int r = 0;
+        if (probe_first) {
+            r = receive_inner_until(ctx, inner, deadline, 0, 0);
+            if (r > 0) {
+                ctx->poll_pending = 0;
+                return r;
+            }
+            if (r < 0) return r;
+        }
+        probe_first = 1;
         uint32_t now = mvci_now_ms();
         if ((int32_t)(now - ctx->poll_sent_ms) > MVCI_POLL_REPLY_MAX_MS) {
-            ctx->poisoned = 1;
             return MVCI_PIPE_DESYNC;
         }
+        if (!timed) return 0;
         if ((int32_t)(deadline - now) <= 0) return MVCI_PIPE_TIMEOUT;
         uint32_t age_deadline = ctx->poll_sent_ms + MVCI_POLL_REPLY_MAX_MS + 1u;
         uint32_t wait_deadline = (int32_t)(deadline - age_deadline) > 0 ? age_deadline : deadline;
-        int r = receive_inner_until(ctx, inner, wait_deadline, 1, 1);
+        r = receive_inner_until(ctx, inner, wait_deadline, 1, 1);
         if (r > 0) {
-            if ((int32_t)(mvci_now_ms() - ctx->poll_sent_ms) > MVCI_POLL_REPLY_MAX_MS) {
-                ctx->poisoned = 1;
-                return MVCI_PIPE_DESYNC;
-            }
             ctx->poll_pending = 0;
-            r = queue_record(ctx, inner, r);
-            if (r < 0) { ctx->poisoned = 1; return r; }
-            return 0;
-        }
-        if (r < 0 && r != MVCI_PIPE_TIMEOUT) {
-            ctx->poisoned = 1;
             return r;
         }
-        if (!r) mvci_sleep_ms(1); /* transport may return before its budget */
+        if (r < 0 && r != MVCI_PIPE_TIMEOUT) return r;
+        if (!r && (int32_t)(wait_deadline - mvci_now_ms()) > 0)
+            mvci_sleep_ms(1); /* transport may return before its budget */
     }
     return 0;
+}
+
+/* Resolve the one tracked poll before sending or purging anything else.
+ * A caller deadline can expire without losing correlation. */
+static int resolve_poll_until(mvci_ctx_t *ctx, uint32_t deadline)
+{
+    uint8_t inner[MVCI_MAX_INNER];
+    int r = receive_pending_poll_until(ctx, inner, deadline, 1, 1);
+    if (r > 0) r = queue_record(ctx, inner, r);
+    if (r < 0 && r != MVCI_PIPE_TIMEOUT) ctx->poisoned = 1;
+    return r > 0 ? 0 : r;
 }
 
 /* The result is byte 3 in the supported ACK shapes. The final padded byte is
@@ -879,7 +893,8 @@ int mvci_poll_until(mvci_ctx_t *ctx, uint8_t *msg_out, size_t cap,
     } else {
         /* Once a poll is sent, its next record belongs to that poll. Do not
          * drain it as unsolicited input across a public read deadline. */
-        r = ctx->poll_pending ? 0 : drain_record(ctx, resp, deadline, timed, work_left);
+        int pending_at_entry = ctx->poll_pending;
+        r = pending_at_entry ? 0 : drain_record(ctx, resp, deadline, timed, work_left);
         if (!r && timed && *work_left && !ctx->rx_used && !ctx->poll_pending) {
             int n = mvci_inner_read_poll(ctx->proto, in);
             int remaining = (int32_t)(deadline - mvci_now_ms());
@@ -901,17 +916,11 @@ int mvci_poll_until(mvci_ctx_t *ctx, uint8_t *msg_out, size_t cap,
             }
         }
         if (!r && ctx->poll_pending && *work_left) {
-            if ((int32_t)(mvci_now_ms() - ctx->poll_sent_ms) > MVCI_POLL_REPLY_MAX_MS)
-                r = MVCI_PIPE_DESYNC;
-            else r = receive_inner_until(ctx, resp, deadline, timed, timed);
+            r = receive_pending_poll_until(ctx, resp, deadline, timed,
+                                           pending_at_entry);
             if (r > 0) {
-                if ((int32_t)(mvci_now_ms() - ctx->poll_sent_ms) > MVCI_POLL_REPLY_MAX_MS)
-                    r = MVCI_PIPE_DESYNC;
-                else {
-                    ctx->poll_pending = 0;
-                    --*work_left;
-                    dbg_hex("RX inner:", resp, r);
-                }
+                --*work_left;
+                dbg_hex("RX inner:", resp, r);
             }
         } else if (!r && timed && *work_left && ctx->rx_used) {
             r = receive_inner_until(ctx, resp, deadline, 1, 1);
@@ -919,11 +928,6 @@ int mvci_poll_until(mvci_ctx_t *ctx, uint8_t *msg_out, size_t cap,
         }
         /* A fully sent poll keeps its exact next-reply correlation across a
          * read deadline or cancellation. Partial writes already poison. */
-        if (ctx->poll_pending &&
-            (int32_t)(mvci_now_ms() - ctx->poll_sent_ms) > MVCI_POLL_REPLY_MAX_MS) {
-            ctx->poisoned = 1;
-            r = MVCI_PIPE_DESYNC;
-        }
         if (r < 0 && r != MVCI_PIPE_TIMEOUT && r != MVCI_PIPE_CANCELED)
             ctx->poisoned = 1;
     }

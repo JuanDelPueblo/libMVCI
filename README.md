@@ -88,8 +88,10 @@ physical timing, electrical behavior, or ECU acceptance.
   not established; no timestamp is synthesized from an assumed cable clock. A
   poll still awaiting its reply at a read deadline remains pending across read
   calls. Other cable commands wait within their own deadline until that reply
-  is classified. A missing reply poisons the session after 1000 ms from the
-  poll send; this conservative bound is not based on measured cable latency.
+  is classified. The provider drains available bytes before applying the
+  1000 ms bound from the poll send. A complete reply remains valid after
+  application idle. If no complete reply is available at the bound, the
+  session is poisoned. This bound is not based on measured cable latency.
   A purge or another poll cannot recover it.
 - **Filters and clear operations.** Only one-byte PASS filters are supported.
   BLOCK, FLOW_CONTROL, longer descriptors and unsupported flags are refused.
