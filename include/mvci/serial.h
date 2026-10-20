@@ -48,6 +48,13 @@
  * ====================================================================== */
 uint8_t mvci_xorsum(const uint8_t *p, size_t n);
 
+/* DES-ECB in place over nblocks 8-byte blocks. The checked calls return 0 on
+ * success and -1 on failure. A backend failure clears the whole buffer, so no
+ * plaintext is left; an argument error (NULL pointer, block count too large for
+ * the backend) leaves it untouched. The void calls do the same work and discard the result: prefer
+ * the checked calls. */
+int  mvci_des_encrypt_checked(const uint8_t key[8], uint8_t *buf, size_t nblocks);
+int  mvci_des_decrypt_checked(const uint8_t key[8], uint8_t *buf, size_t nblocks);
 void mvci_des_encrypt(const uint8_t key[8], uint8_t *buf, size_t nblocks);
 void mvci_des_decrypt(const uint8_t key[8], uint8_t *buf, size_t nblocks);
 

@@ -48,7 +48,7 @@ int mvci_frame_enc(const uint8_t key[8], const uint8_t *inner, size_t inner_len,
     if (clen > sizeof body || clen > MVCI_MAX_WIRE_CIPHER) return -1;
     memset(body, 0, clen);
     memcpy(body, inner, inner_len);
-    mvci_des_encrypt(key, body, nb);
+    if (mvci_des_encrypt_checked(key, body, nb) != 0) return -1;
     return mvci_frame_plain(body, clen, out, out_cap);
 }
 
@@ -74,7 +74,7 @@ int mvci_frame_decrypt(const uint8_t key[8], const uint8_t *frame, size_t frame_
     uint8_t cs_cipher = mvci_xorsum(frame, frame_len - 1);     /* over ciphertext */
 
     memcpy(inner_out, frame + 2, plen);
-    mvci_des_decrypt(key, inner_out, plen / 8);
+    if (mvci_des_decrypt_checked(key, inner_out, plen / 8) != 0) return -1;
 
     /* status replies checksum over ciphertext, message replies over plaintext */
     uint8_t cs_plain = frame[0] ^ frame[1] ^ mvci_xorsum(inner_out, plen);

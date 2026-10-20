@@ -90,7 +90,12 @@ static int ft_load(void)
     return 0;
 }
 
-struct mvci_io { FT_HANDLE h; };
+/* purge_failed: mvci_io_purge_rx() returns void, so a failed purge is kept here
+ * and fails reads and writes until a later purge succeeds, instead of leaving
+ * stale bytes to be framed. */
+struct mvci_io { FT_HANDLE h; int purge_failed; };
+
+#define FT_TRY(call)  do { if ((call) != FT_OK) goto fail; } while (0)
 
 mvci_io_t *mvci_io_open(const char *port)
 {
@@ -105,25 +110,30 @@ mvci_io_t *mvci_io_open(const char *port)
         return NULL;
     }
 
-    FT.SetBaudRate(io->h, 115200);
-    FT.SetDataCharacteristics(io->h, FT_BITS_8, FT_STOP_BITS_1, FT_PARITY_NONE);
-    FT.SetFlowControl(io->h, FT_FLOW_NONE, 0, 0);
-    FT.SetLatencyTimer(io->h, 2);
-    FT.SetTimeouts(io->h, 100, 1000);          /* default rx/tx ms */
+    FT_TRY(FT.SetBaudRate(io->h, 115200));
+    FT_TRY(FT.SetDataCharacteristics(io->h, FT_BITS_8, FT_STOP_BITS_1, FT_PARITY_NONE));
+    FT_TRY(FT.SetFlowControl(io->h, FT_FLOW_NONE, 0, 0));
+    FT_TRY(FT.SetLatencyTimer(io->h, 2));
+    FT_TRY(FT.SetTimeouts(io->h, 100, 1000));   /* default rx/tx ms */
 
-    FT.ResetDevice(io->h);
-    FT.Purge(io->h, FT_PURGE_RX);
-    FT.ResetDevice(io->h);
+    FT_TRY(FT.ResetDevice(io->h));
+    FT_TRY(FT.Purge(io->h, FT_PURGE_RX));
+    FT_TRY(FT.ResetDevice(io->h));
 
     /* DTR pulse = MCU reset (FT_ClrRts, FT_SetDtr, 15 ms, FT_ClrDtr) */
-    FT.ClrRts(io->h);
-    FT.SetDtr(io->h);
+    FT_TRY(FT.ClrRts(io->h));
+    FT_TRY(FT.SetDtr(io->h));
     mvci_sleep_ms(15);
-    FT.ClrDtr(io->h);
+    FT_TRY(FT.ClrDtr(io->h));
 
     mvci_sleep_ms(1000);                        /* MCU boot */
-    FT.Purge(io->h, FT_PURGE_RX);
+    FT_TRY(FT.Purge(io->h, FT_PURGE_RX));
     return io;
+
+fail:
+    FT.Close(io->h);
+    free(io);
+    return NULL;
 }
 
 void mvci_io_close(mvci_io_t *io)
@@ -136,21 +146,29 @@ void mvci_io_close(mvci_io_t *io)
 int mvci_io_write(mvci_io_t *io, const uint8_t *buf, int n)
 {
     DWORD written = 0;
+    if (!io || n < 0 || (n > 0 && !buf) || io->purge_failed) return -1;
+    if (n == 0) return 0;
+    /* A short count is the D2XX write timeout: report it, never retry here. */
     if (FT.Write(io->h, (LPVOID)buf, (DWORD)n, &written) != FT_OK) return -1;
-    return (int)written;
+    return written == (DWORD)n ? n : -1;
 }
 
 int mvci_io_read(mvci_io_t *io, uint8_t *buf, int n, int timeout_ms)
 {
     DWORD got = 0;
-    FT.SetTimeouts(io->h, (ULONG)timeout_ms, 1000);
+    if (!io || n < 0 || (n > 0 && !buf) || io->purge_failed) return -1;
+    if (n == 0) return 0;
+    /* A read timeout of 0 may mean "wait forever" in D2XX, and a negative value
+     * would become a huge ULONG: always pass at least 1 ms. */
+    if (timeout_ms < 1) timeout_ms = 1;
+    if (FT.SetTimeouts(io->h, (ULONG)timeout_ms, 1000) != FT_OK) return -1;
     if (FT.Read(io->h, buf, (DWORD)n, &got) != FT_OK) return -1;
-    return (int)got;
+    return got <= (DWORD)n ? (int)got : -1;     /* got < n is a timeout */
 }
 
 void mvci_io_purge_rx(mvci_io_t *io)
 {
-    FT.Purge(io->h, FT_PURGE_RX);
+    if (io) io->purge_failed = (FT.Purge(io->h, FT_PURGE_RX) != FT_OK);
 }
 
 /* ====================================================================== */
