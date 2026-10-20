@@ -13,6 +13,11 @@
  *  Pure codec
  * ====================================================================== */
 
+/* The one-byte frame length includes the 3-byte header/trailer. Encrypted
+ * payloads must also contain whole DES blocks, so 248 is the largest cipher
+ * body that can fit in a valid frame (255 - 3, rounded down to 8 bytes). */
+#define MVCI_MAX_WIRE_CIPHER (((UINT8_MAX - 3u) / 8u) * 8u)
+
 uint8_t mvci_xorsum(const uint8_t *p, size_t n)
 {
     uint8_t c = 0;
@@ -22,8 +27,9 @@ uint8_t mvci_xorsum(const uint8_t *p, size_t n)
 
 int mvci_frame_plain(const uint8_t *payload, size_t plen, uint8_t *out, size_t out_cap)
 {
+    if (!out || (plen && !payload) || plen > UINT8_MAX - 3u) return -1;
     size_t total = plen + 3;
-    if (total > 255 || total > out_cap) return -1;
+    if (total > out_cap) return -1;
     out[0] = (uint8_t)total;
     out[1] = 0x00;
     if (plen) memcpy(out + 2, payload, plen);
@@ -34,10 +40,12 @@ int mvci_frame_plain(const uint8_t *payload, size_t plen, uint8_t *out, size_t o
 int mvci_frame_enc(const uint8_t key[8], const uint8_t *inner, size_t inner_len,
                    uint8_t *out, size_t out_cap)
 {
+    if (!key || !inner || !out || inner_len == 0 || inner_len > MVCI_MAX_WIRE_CIPHER)
+        return -1;
     uint8_t body[MVCI_MAX_INNER];
-    size_t nb = (inner_len + 7) / 8;
+    size_t nb = inner_len / 8 + (inner_len % 8 != 0);
     size_t clen = nb * 8;
-    if (clen > sizeof body) return -1;
+    if (clen > sizeof body || clen > MVCI_MAX_WIRE_CIPHER) return -1;
     memset(body, 0, clen);
     memcpy(body, inner, inner_len);
     mvci_des_encrypt(key, body, nb);
@@ -46,7 +54,7 @@ int mvci_frame_enc(const uint8_t key[8], const uint8_t *inner, size_t inner_len,
 
 int mvci_frame_payload(const uint8_t *frame, size_t frame_len, const uint8_t **payload_out)
 {
-    if (frame_len < 3) return -1;
+    if (!frame || frame_len < 3 || frame_len > UINT8_MAX) return -1;
     if (frame[0] != frame_len) return -1;
     if (frame[1] != 0x00) return -1;
     if (mvci_xorsum(frame, frame_len - 1) != frame[frame_len - 1]) return -1;
@@ -57,7 +65,8 @@ int mvci_frame_payload(const uint8_t *frame, size_t frame_len, const uint8_t **p
 int mvci_frame_decrypt(const uint8_t key[8], const uint8_t *frame, size_t frame_len,
                        uint8_t *inner_out, size_t inner_cap)
 {
-    if (frame_len < 3 || frame[0] != frame_len || frame[1] != 0x00) return -1;
+    if (!key || !frame || !inner_out || frame_len < 3 || frame_len > UINT8_MAX ||
+        frame[0] != frame_len || frame[1] != 0x00) return -1;
     int plen = (int)frame_len - 3;
     if (plen <= 0 || (plen % 8) != 0 || (size_t)plen > inner_cap) return -1;
 
@@ -81,6 +90,7 @@ static void put_u32(uint8_t *p, uint32_t v)
 
 int mvci_inner_set_config(uint32_t proto, uint32_t param, uint32_t value, uint8_t *inner)
 {
+    if (!inner) return -1;
     inner[0] = 0x0e; inner[1] = 0x00; inner[2] = 0x0e; inner[3] = 0x02;
     put_u32(inner + 4, proto);
     put_u32(inner + 8, param);
@@ -90,6 +100,7 @@ int mvci_inner_set_config(uint32_t proto, uint32_t param, uint32_t value, uint8_
 
 int mvci_inner_connect(uint32_t proto, uint32_t flags, uint32_t baud, uint8_t *inner)
 {
+    if (!inner) return -1;
     inner[0] = 0x0d; inner[1] = 0x00; inner[2] = 0x07;
     put_u32(inner + 3, proto);
     put_u32(inner + 7, flags);
@@ -100,6 +111,7 @@ int mvci_inner_connect(uint32_t proto, uint32_t flags, uint32_t baud, uint8_t *i
 int mvci_inner_start_filter(uint32_t proto, uint32_t msgid, uint32_t type,
                             uint8_t mask, uint8_t pattern, uint8_t *inner)
 {
+    if (!inner) return -1;
     inner[0] = 0x10; inner[1] = 0x00; inner[2] = 0x0b;
     put_u32(inner + 3, proto);
     put_u32(inner + 7, msgid);
@@ -111,6 +123,7 @@ int mvci_inner_start_filter(uint32_t proto, uint32_t msgid, uint32_t type,
 
 int mvci_inner_clear_periodic(uint32_t proto, uint8_t *inner)
 {
+    if (!inner) return -1;
     static const uint8_t b[4] = { 0x06, 0x00, 0x0e, 0x09 };
     memcpy(inner, b, 4);
     put_u32(inner + 4, proto);
@@ -119,7 +132,7 @@ int mvci_inner_clear_periodic(uint32_t proto, uint8_t *inner)
 
 int mvci_inner_fast_init(uint32_t proto, const uint8_t *init, size_t n, uint8_t *inner)
 {
-    if (!init || n == 0 || !inner || n > MVCI_MAX_INNER - 8) return -1;
+    if (!init || n == 0 || !inner || n > MVCI_MAX_WIRE_CIPHER - 8u) return -1;
     inner[0] = (uint8_t)(5 + 1 + n);
     inner[1] = 0x00; inner[2] = 0x0e; inner[3] = 0x05;
     put_u32(inner + 4, proto);
@@ -129,7 +142,7 @@ int mvci_inner_fast_init(uint32_t proto, const uint8_t *init, size_t n, uint8_t 
 
 int mvci_inner_five_baud_init(uint32_t proto, const uint8_t *addr, size_t naddr, uint8_t *inner)
 {
-    if (!addr || !inner || naddr == 0 || naddr > MVCI_MAX_INNER - 8) return -1;
+    if (!inner || !addr || naddr == 0 || naddr > MVCI_MAX_WIRE_CIPHER - 8u) return -1;
     inner[0] = (uint8_t)(6 + naddr);
     inner[1] = 0x00; inner[2] = 0x0e; inner[3] = 0x04;
     put_u32(inner + 4, proto);
@@ -139,6 +152,7 @@ int mvci_inner_five_baud_init(uint32_t proto, const uint8_t *addr, size_t naddr,
 
 int mvci_inner_prog_voltage(uint32_t pin, uint32_t voltage, uint8_t *inner)
 {
+    if (!inner) return -1;
     inner[0] = 0x09; inner[1] = 0x00; inner[2] = 0x0d;
     put_u32(inner + 3, pin);
     put_u32(inner + 7, voltage);
@@ -150,6 +164,7 @@ int mvci_inner_prog_voltage(uint32_t pin, uint32_t voltage, uint8_t *inner)
  * start-filter command carried. */
 int mvci_inner_stop_filter(uint32_t proto, uint32_t msgid, uint8_t *inner)
 {
+    if (!inner) return -1;
     inner[0] = 0x09; inner[1] = 0x00; inner[2] = 0x0c;
     put_u32(inner + 3, proto);
     put_u32(inner + 7, msgid);
@@ -158,7 +173,7 @@ int mvci_inner_stop_filter(uint32_t proto, uint32_t msgid, uint8_t *inner)
 
 int mvci_inner_write_msg(uint32_t proto, const uint8_t *msg, size_t n, uint8_t *inner)
 {
-    if (n > MVCI_MAX_INNER - 11) return -1;
+    if (!inner || (n && !msg) || n > MVCI_MAX_WIRE_CIPHER - 11u) return -1;
     inner[0] = (uint8_t)(1 + 8 + n);
     inner[1] = 0x00; inner[2] = 0x0a;
     put_u32(inner + 3, proto);
@@ -169,6 +184,7 @@ int mvci_inner_write_msg(uint32_t proto, const uint8_t *msg, size_t n, uint8_t *
 
 int mvci_inner_read_poll(uint32_t proto, uint8_t *inner)
 {
+    if (!inner) return -1;
     inner[0] = 0x05; inner[1] = 0x00; inner[2] = 0x09;
     put_u32(inner + 3, proto);
     inner[7] = 0x00;
@@ -178,12 +194,18 @@ int mvci_inner_read_poll(uint32_t proto, uint8_t *inner)
 int mvci_parse_read_reply(const uint8_t *inner, int inner_len,
                           uint8_t *msg_out, size_t cap, uint8_t *rxstatus_out)
 {
-    if (inner_len < 4 || inner[2] != 0x09) return -1;
-    if (rxstatus_out) *rxstatus_out = inner[3];
+    if (!inner || inner_len < 4 || inner_len > MVCI_MAX_INNER || inner[2] != 0x09)
+        return -1;
     int mlen = (int)inner[0] - 9;                  /* msg at offset 11 */
-    if (mlen <= 0) return 0;                        /* status reply, no message */
-    if (11 + mlen > inner_len || (size_t)mlen > cap) return -1;
+    if (mlen <= 0) {
+        if (rxstatus_out) *rxstatus_out = inner[3];
+        return 0;                                   /* status reply, no message */
+    }
+    if (inner_len < 11 || (size_t)mlen > (size_t)inner_len - 11u ||
+        (size_t)mlen > cap || !msg_out)
+        return -1;
     memcpy(msg_out, inner + 11, mlen);
+    if (rxstatus_out) *rxstatus_out = inner[3];
     return mlen;
 }
 
