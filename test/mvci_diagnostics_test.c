@@ -54,6 +54,9 @@ int main(void)
           strcmp(error, "invalid device id") == 0,
           "invalid device failure replaces stale text");
 
+    check(PassThruReadVersion(device, NULL, library, api) == ERR_NULL_PARAMETER,
+          "caller keeps a different error before thread starts");
+
     pthread_t thread;
     int created = pthread_create(&thread, NULL, thread_error, NULL) == 0;
     check(created, "create diagnostics isolation thread");
@@ -63,7 +66,7 @@ int main(void)
         check((intptr_t)thread_result == 1, "thread reads its own last error");
     }
     check(PassThruGetLastError(error) == STATUS_NOERROR &&
-          strcmp(error, "invalid device id") == 0,
+          strcmp(error, "NULL version output") == 0,
           "other thread does not overwrite caller error");
 
     check(PassThruClose(device) == STATUS_NOERROR, "close scripted device");
