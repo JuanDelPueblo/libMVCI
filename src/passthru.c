@@ -348,8 +348,10 @@ J2534_LONG J2534_API PassThruIoctl(J2534_ULONG ChannelID, J2534_ULONG IoctlID,
     case FAST_INIT: {
         PASSTHRU_MSG *in = (PASSTHRU_MSG *)pInput;
         PASSTHRU_MSG *out = (PASSTHRU_MSG *)pOutput;
-        if (!in || in->DataSize == 0) return ERR_NULL_PARAMETER;
-        uint8_t reply[32];
+        if (!in || !out) { set_err("NULL fast init message"); return ERR_NULL_PARAMETER; }
+        if (in->DataSize == 0) { set_err("pattern-only fast init unsupported"); return ERR_NOT_SUPPORTED; }
+        if (in->DataSize > sizeof in->Data) { set_err("fast init input too large"); return ERR_INVALID_IOCTL_VALUE; }
+        uint8_t reply[61];
         int k = mvci_fast_init(s->ctx, in->Data, in->DataSize, reply, sizeof reply);
         if (k == MVCI_FI_TIMEOUT) {
             if (out) {
@@ -360,30 +362,34 @@ J2534_LONG J2534_API PassThruIoctl(J2534_ULONG ChannelID, J2534_ULONG IoctlID,
             return ERR_TIMEOUT;
         }
         if (k < 0) { set_err("fast init failed"); return ERR_FAILED; }
-        if (out) {
-            memset(out, 0, sizeof *out);
-            out->ProtocolID = s->proto;
-            out->DataSize = (uint32_t)k;
-            memcpy(out->Data, reply, (size_t)k);
-        }
+        memset(out, 0, sizeof *out);
+        out->ProtocolID = s->proto;
+        out->DataSize = (uint32_t)k;
+        memcpy(out->Data, reply, (size_t)k);
         return STATUS_NOERROR;
     }
 
     case FIVE_BAUD_INIT: {
         SBYTE_ARRAY *in = (SBYTE_ARRAY *)pInput;
         SBYTE_ARRAY *out = (SBYTE_ARRAY *)pOutput;
-        if (!in || in->NumOfBytes == 0 || !in->BytePtr) return ERR_INVALID_IOCTL_VALUE;
-        uint8_t reply[32];
+        if (!in || !out) { set_err("NULL five-baud init array"); return ERR_NULL_PARAMETER; }
+        if (in->NumOfBytes == 0 || !in->BytePtr) { set_err("empty five-baud init address"); return ERR_INVALID_IOCTL_VALUE; }
+        if (in->NumOfBytes > MVCI_MAX_INNER - 8) { set_err("five-baud init address too large"); return ERR_FAILED; }
+        if (!out->BytePtr) { set_err("NULL five-baud output buffer"); return ERR_NULL_PARAMETER; }
+        if (out->NumOfBytes < 2) {
+            out->NumOfBytes = 2;
+            set_err("five-baud output buffer too small; required 2 bytes");
+            return ERR_FAILED;
+        }
+        uint8_t reply[2];
         int k = mvci_five_baud_init(s->ctx, in->BytePtr, in->NumOfBytes, reply, sizeof reply);
         if (k == MVCI_FB_NOT_CONNECTED) {
             set_err("five-baud no ECU answer");
             return ERR_DEVICE_NOT_CONNECTED;
         }
         if (k < 0) { set_err("five-baud failed"); return ERR_FAILED; }
-        if (out && out->BytePtr && out->NumOfBytes >= (uint32_t)k) {
-            memcpy(out->BytePtr, reply, (size_t)k);
-            out->NumOfBytes = (uint32_t)k;
-        }
+        memcpy(out->BytePtr, reply, (size_t)k);
+        out->NumOfBytes = (uint32_t)k;
         return STATUS_NOERROR;
     }
 

@@ -119,7 +119,7 @@ int mvci_inner_clear_periodic(uint32_t proto, uint8_t *inner)
 
 int mvci_inner_fast_init(uint32_t proto, const uint8_t *init, size_t n, uint8_t *inner)
 {
-    if (n > MVCI_MAX_INNER - 8) return -1;
+    if (!init || n == 0 || !inner || n > MVCI_MAX_INNER - 8) return -1;
     inner[0] = (uint8_t)(5 + 1 + n);
     inner[1] = 0x00; inner[2] = 0x0e; inner[3] = 0x05;
     put_u32(inner + 4, proto);
@@ -129,7 +129,7 @@ int mvci_inner_fast_init(uint32_t proto, const uint8_t *init, size_t n, uint8_t 
 
 int mvci_inner_five_baud_init(uint32_t proto, const uint8_t *addr, size_t naddr, uint8_t *inner)
 {
-    if (!addr || naddr == 0 || naddr > MVCI_MAX_INNER - 8) return -1;
+    if (!addr || !inner || naddr == 0 || naddr > MVCI_MAX_INNER - 8) return -1;
     inner[0] = (uint8_t)(6 + naddr);
     inner[1] = 0x00; inner[2] = 0x0e; inner[3] = 0x04;
     put_u32(inner + 4, proto);
@@ -498,12 +498,11 @@ int mvci_five_baud_init(mvci_ctx_t *ctx, const uint8_t *addr, size_t naddr,
     mvci_sleep_ms(2000);
     int r = mvci_transact(ctx, in, (size_t)ilen, resp, sizeof resp, 5000);
     if (mvci_five_baud_is_disconnected(resp, r)) return MVCI_FB_NOT_CONNECTED;
-    if (mvci_five_baud_is_corolla_success(resp, r) && out && cap >= 2) {
-        out[0] = resp[3];
-        out[1] = resp[4];
-        return 2;
-    }
-    return -1;
+    if (!mvci_five_baud_is_corolla_success(resp, r)) return -1;
+    if (!out || cap < 2) return -1;
+    out[0] = resp[3];
+    out[1] = resp[4];
+    return 2;
 }
 
 int mvci_clear_periodic(mvci_ctx_t *ctx)
@@ -518,9 +517,10 @@ int mvci_fast_init(mvci_ctx_t *ctx, const uint8_t *init, size_t n,
                    uint8_t *resp_out, size_t cap)
 {
     uint8_t in[MVCI_MAX_INNER], resp[64];
+    if (!ctx || !resp_out) return -1;
     int ilen = mvci_inner_fast_init(ctx->proto, init, n, in);
     if (ilen < 0) return -1;
-    int r = mvci_transact(ctx, in, ilen, resp, sizeof resp, 3000);
+    int r = mvci_transact(ctx, in, (size_t)ilen, resp, sizeof resp, 3000);
     if (r < 3 || resp[2] != 0x0e) return -1;
     if (mvci_fast_init_is_timeout(resp, r)) return MVCI_FI_TIMEOUT;
     if (resp[0] == 0x02) {
@@ -528,9 +528,9 @@ int mvci_fast_init(mvci_ctx_t *ctx, const uint8_t *init, size_t n,
         return -1;
     }
     int mlen = (int)resp[0] - 1;                 /* 08 -> 7 ECU key bytes @ off 3 */
-    if (mlen < 0 || 3 + mlen > r) mlen = (r > 3) ? r - 3 : 0;
-    if ((size_t)mlen > cap) mlen = (int)cap;
-    if (mlen > 0) memcpy(resp_out, resp + 3, mlen);
+    if (mlen < 0 || 3 + mlen > r) return -1;
+    if ((size_t)mlen > cap) return -1;
+    if (mlen > 0) memcpy(resp_out, resp + 3, (size_t)mlen);
     return mlen;
 }
 

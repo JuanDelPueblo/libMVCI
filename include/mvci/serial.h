@@ -120,9 +120,9 @@ int mvci_set_prog_voltage(mvci_ctx_t *ctx, uint32_t pin, uint32_t voltage);
 int mvci_clear_periodic(mvci_ctx_t *ctx);
 /* Clear software and host serial RX queues only. No adapter command. */
 int mvci_clear_rx_buffer(mvci_ctx_t *ctx);
-/* Five-baud init. Returns key byte count (>=0), MVCI_FB_NOT_CONNECTED (-2)
- * for the evidenced OBD-disconnected status reply, or -1 for any other
- * failure. No success wire shape is proven, so any other reply fails closed. */
+/* Five-baud init. Returns the two key bytes from the exact evidenced Corolla
+ * success reply (currently 08 08), MVCI_FB_NOT_CONNECTED (-2) for the
+ * evidenced OBD-disconnected reply, or -1 for any other failure. */
 int mvci_five_baud_init(mvci_ctx_t *ctx, const uint8_t *addr, size_t naddr,
                         uint8_t *out, size_t cap);
 #define MVCI_FB_NOT_CONNECTED (-2)

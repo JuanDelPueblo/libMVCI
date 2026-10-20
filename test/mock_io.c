@@ -39,10 +39,14 @@ static int g_async_reply;
 static uint32_t g_protocol;
 static int g_poll_reply, g_device_reply_pending;
 static uint8_t g_config_status;
+static int g_five_baud_success;
+static int g_fast_reply_len;
 
 void mock_async_reply(int mode) { g_async_reply = mode; }
 void mock_poll_reply(void) { g_poll_reply = 1; }
 void mock_config_status(uint8_t status) { g_config_status = status; }
+void mock_five_baud_success(int enabled) { g_five_baud_success = enabled; }
+void mock_fast_reply_length(int length) { g_fast_reply_len = length; }
 
 const uint8_t *mock_key(void) { return MOCK_KEY; }
 
@@ -149,10 +153,26 @@ static void answer(const uint8_t *inner, int ilen)
         static const uint8_t r[8] = { 0x02, 0x00, 0x0c, 0x00, 0x00, 0x00, 0x00, 0xb8 };
         memcpy(st, r, 8);
     } else if (ilen >= 4 && inner[2] == 0x0e && inner[3] == 0x04) {
-        /* Exact T254 OBD-disconnected five-baud reply. */
-        static const uint8_t r[8] = { 0x02, 0x00, 0x0e, 0x08, 0x00, 0x00, 0x00, 0x28 };
-        memcpy(st, r, 8);
+        if (g_five_baud_success) {
+            static const uint8_t r[8] = { 0x03, 0x00, 0x0e, 0x08, 0x08, 0x00, 0x00, 0x00 };
+            memcpy(st, r, 8);
+            g_five_baud_success = 0;
+        } else {
+            static const uint8_t r[8] = { 0x02, 0x00, 0x0e, 0x08, 0x00, 0x00, 0x00, 0x28 };
+            memcpy(st, r, 8);
+        }
     } else if (ilen >= 4 && inner[2] == 0x0e && inner[3] == 0x05) {
+        if (g_fast_reply_len > 0) {
+            uint8_t r[MVCI_MAX_INNER] = {0};
+            size_t n = (size_t)g_fast_reply_len + 3;
+            r[0] = (uint8_t)(g_fast_reply_len + 1); r[2] = 0x0e;
+            for (int i = 0; i < g_fast_reply_len; i++) r[3 + i] = (uint8_t)(0x80 + i);
+            uint8_t frame[MVCI_MAX_FRAME];
+            int fn = mvci_frame_enc(MOCK_KEY, r, n, frame, sizeof frame);
+            if (fn > 0) queue_bytes(frame, fn);
+            g_fast_reply_len = 0;
+            return;
+        }
         /* Exact T255 OBD-disconnected fast-init reply. */
         static const uint8_t r[8] = { 0x02, 0x00, 0x0e, 0x08, 0x00, 0x00, 0x00, 0xf0 };
         memcpy(st, r, 8);
@@ -213,6 +233,8 @@ mvci_io_t *mvci_io_open(const char *port)
     g_qhead = g_qtail = 0;
     g_async_reply = 0;
     g_config_status = 0;
+    g_five_baud_success = 0;
+    g_fast_reply_len = 0;
     g_protocol = 0;
     g_poll_reply = g_device_reply_pending = 0;
     return &g_io;
