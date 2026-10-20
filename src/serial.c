@@ -255,6 +255,9 @@ struct mvci_ctx {
     int              overflow;
     int              rx_purge_failed;
     mvci_mutex_t     lock;       /* serialises device I/O */
+    int              in_poll;    /* a read poll owns lock; only it honours cancel */
+    mvci_mutex_t     cancel_lock; /* leaf lock: never held across any other call */
+    int              cancel;     /* set by a waiting Close/Disconnect */
     mvci_thread_t    ka_thread;
     volatile int     ka_run;
 };
@@ -282,6 +285,7 @@ mvci_ctx_t *mvci_open(const char *port)
     if (!ctx->io) { free(ctx); return NULL; }
     ctx->proto = MVCI_ISO14230;      /* until PassThruConnect selects one */
     mvci_mutex_init(&ctx->lock);
+    mvci_mutex_init(&ctx->cancel_lock);
     return ctx;
 }
 
@@ -291,6 +295,7 @@ void mvci_close(mvci_ctx_t *ctx)
     mvci_stop_keepalive(ctx);
     mvci_io_close(ctx->io);
     mvci_mutex_destroy(&ctx->lock);
+    mvci_mutex_destroy(&ctx->cancel_lock);
     free(ctx);
 }
 
@@ -299,11 +304,37 @@ const uint8_t *mvci_key(const mvci_ctx_t *ctx)
     return ctx->have_key ? ctx->key : NULL;
 }
 
+/* A read poll waits in slices of this length and checks for cancel between
+ * them. The original caller deadline still ends the wait: a slice never
+ * shortens the budget of a read that nobody cancels. */
+#define MVCI_READ_SLICE_MS 20
+
+void mvci_set_read_cancel(mvci_ctx_t *ctx, int on)
+{
+    if (!ctx) return;
+    mvci_mutex_lock(&ctx->cancel_lock);
+    ctx->cancel = on != 0;
+    mvci_mutex_unlock(&ctx->cancel_lock);
+}
+
+static int cancel_requested(mvci_ctx_t *ctx)
+{
+    mvci_mutex_lock(&ctx->cancel_lock);
+    int c = ctx->cancel;
+    mvci_mutex_unlock(&ctx->cancel_lock);
+    return c;
+}
+
 /* Retain fragments across nonblocking drains. A partial command reply at its
  * deadline poisons the transaction in the caller; never guess a new boundary. */
 static int read_frame_until(mvci_ctx_t *ctx, uint8_t *buf, int cap,
                              uint32_t deadline, int timed, int may_wait)
 {
+    int empty_slices = 0, max_empty = 0;
+    if (may_wait && ctx->in_poll && timed) {
+        int r0 = (int32_t)(deadline - mvci_now_ms());
+        max_empty = (r0 > 0 ? r0 / MVCI_READ_SLICE_MS : 0) + 2;
+    }
     for (;;) {
         /* A nonblocking transport call can still take execution time. Keep
          * all bytes in rx_frame if it crosses the caller's deadline. */
@@ -317,10 +348,19 @@ static int read_frame_until(mvci_ctx_t *ctx, uint8_t *buf, int cap,
             ctx->rx_used = 0;
             return target;
         }
+        int wait = may_wait ? remaining : 0;
+        int sliced = max_empty && wait > MVCI_READ_SLICE_MS;
+        if (sliced) wait = MVCI_READ_SLICE_MS;
         int n = mvci_io_read(ctx->io, ctx->rx_frame + ctx->rx_used,
-                             target - ctx->rx_used, may_wait ? remaining : 0);
+                             target - ctx->rx_used, wait);
         if (n < 0) return MVCI_PIPE_IO;
-        if (!n) return 0;
+        if (!n) {
+            /* An empty slice is not the end of the caller's budget. The cap
+             * keeps a transport that returns early from spinning forever. */
+            if (max_empty && cancel_requested(ctx)) return MVCI_PIPE_CANCELED;
+            if (sliced && ++empty_slices <= max_empty) continue;
+            return 0;
+        }
         if (n > target - ctx->rx_used) return MVCI_PIPE_DESYNC;
         ctx->rx_used += n;
     }
@@ -436,10 +476,11 @@ int mvci_handshake(mvci_ctx_t *ctx)
 
 /* Caller budgets include waiting for the I/O owner. A zero-timeout drain
  * never waits behind a command transaction. */
-static int lock_until(mvci_ctx_t *ctx, uint32_t deadline, int may_wait)
+static int lock_until(mvci_ctx_t *ctx, uint32_t deadline, int may_wait, int cancellable)
 {
     for (;;) {
         if (may_wait && (int32_t)(deadline - mvci_now_ms()) <= 0) return 0;
+        if (cancellable && cancel_requested(ctx)) return -1;
 #ifdef _WIN32
         if (TryEnterCriticalSection(&ctx->lock)) return 1;
 #else
@@ -534,7 +575,7 @@ int mvci_transact(mvci_ctx_t *ctx, const uint8_t *inner, size_t inner_len,
     if (!ctx || !ctx->have_key || !inner || inner_len < 3 ||
         !resp_inner || timeout_ms < 0) return MVCI_PIPE_DESYNC;
     uint32_t started = mvci_now_ms();
-    if (!lock_until(ctx, started + (uint32_t)timeout_ms, timeout_ms > 0))
+    if (!lock_until(ctx, started + (uint32_t)timeout_ms, timeout_ms > 0, 0))
         return MVCI_PIPE_TIMEOUT;
     int elapsed = (int32_t)(mvci_now_ms() - started);
     timeout_ms = elapsed >= timeout_ms ? 0 : timeout_ms - elapsed;
@@ -616,7 +657,9 @@ int mvci_disconnect(mvci_ctx_t *ctx)
         return -1;
     }
     int ok = -1;
+    int sent = 0;
     if (mvci_io_write(ctx->io, frame, n) == n) {
+        sent = 1;
         int got = 0;
         uint32_t deadline = mvci_now_ms() + 1000;
         while (got < (int)sizeof exp && (int32_t)(deadline - mvci_now_ms()) > 0) {
@@ -626,6 +669,18 @@ int mvci_disconnect(mvci_ctx_t *ctx)
             else mvci_sleep_ms(1);
         }
         if (got == (int)sizeof exp && memcmp(rx, exp, sizeof exp) == 0) ok = 0;
+    }
+    /* A Disconnect that was sent but not answered with the exact reply has an
+     * unknown result, and a later reply can not be told from this one: the
+     * context needs Close/Open. */
+    if (sent && ok != 0) ctx->poisoned = 1;
+    if (ok == 0) {
+        /* The exact Disconnect reply is the clean session boundary. Frames
+         * queued from the old session must not reach the next one. An
+         * ambiguous earlier command stays poisoned: only Close/Open clears it. */
+        ctx->pending_count = 0;
+        ctx->rx_used = 0;
+        ctx->overflow = 0;
     }
     mvci_mutex_unlock(&ctx->lock);
     return ok;
@@ -735,9 +790,14 @@ int mvci_poll_until(mvci_ctx_t *ctx, uint8_t *msg_out, size_t cap,
 {
     uint8_t in[8], resp[MVCI_MAX_INNER];
     if (!ctx || !ctx->have_key || !msg_out || !work_left) return MVCI_PIPE_DESYNC;
-    if (!lock_until(ctx, deadline, timed)) return MVCI_PIPE_TIMEOUT;
+    int got = lock_until(ctx, deadline, timed, 1);
+    if (got < 0) return MVCI_PIPE_CANCELED;   /* nothing sent, nothing lost */
+    if (!got) return MVCI_PIPE_TIMEOUT;
     int r, from_pending = 0;
-    if (ctx->rx_purge_failed) {
+    ctx->in_poll = 1;
+    if (cancel_requested(ctx)) {
+        r = MVCI_PIPE_CANCELED;               /* before any command: no poison */
+    } else if (ctx->rx_purge_failed) {
         r = MVCI_PIPE_IO;
     } else if (ctx->overflow) {
         ctx->overflow = 0;
@@ -763,7 +823,8 @@ int mvci_poll_until(mvci_ctx_t *ctx, uint8_t *msg_out, size_t cap,
         }
         /* A buffered-read timeout has no outstanding command. Retain its
          * complete or partial frame; a command timeout poisons itself above. */
-        if (r < 0 && r != MVCI_PIPE_TIMEOUT) ctx->poisoned = 1;
+        if (r < 0 && r != MVCI_PIPE_TIMEOUT && r != MVCI_PIPE_CANCELED)
+            ctx->poisoned = 1;
     }
     if (r > 0) {
         int n = read_record(resp, r);
@@ -785,6 +846,7 @@ int mvci_poll_until(mvci_ctx_t *ctx, uint8_t *msg_out, size_t cap,
     } else if (!r && timed && (int32_t)(deadline - mvci_now_ms()) <= 0) {
         r = MVCI_PIPE_TIMEOUT;
     }
+    ctx->in_poll = 0;
     mvci_mutex_unlock(&ctx->lock);
     return r;
 }
@@ -797,6 +859,26 @@ int mvci_poll(mvci_ctx_t *ctx, uint8_t *msg_out, size_t cap,
     return mvci_poll_until(ctx, msg_out, cap, rxstatus_out,
                            mvci_now_ms() + (uint32_t)timeout_ms,
                            timeout_ms > 0, &work_left);
+}
+
+int mvci_reset_session(mvci_ctx_t *ctx)
+{
+    if (!ctx || !ctx->have_key) return MVCI_PIPE_DESYNC;
+    mvci_mutex_lock(&ctx->lock);
+    int r = 0;
+    if (ctx->poisoned) {
+        r = MVCI_PIPE_DESYNC;
+    } else if (mvci_io_purge_rx_checked(ctx->io) != 0) {
+        ctx->rx_purge_failed = 1;
+        r = MVCI_PIPE_IO;
+    } else {
+        ctx->rx_purge_failed = 0;
+        ctx->pending_count = 0;
+        ctx->rx_used = 0;
+        ctx->overflow = 0;
+    }
+    mvci_mutex_unlock(&ctx->lock);
+    return r;
 }
 
 int mvci_clear_rx_buffer(mvci_ctx_t *ctx)

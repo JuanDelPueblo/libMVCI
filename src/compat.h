@@ -1,4 +1,4 @@
-/* mvci_compat.h — tiny cross-platform layer: timing, mutex, thread. */
+/* mvci_compat.h — tiny cross-platform layer: timing, mutex, condition, thread. */
 #ifndef MVCI_COMPAT_H
 #define MVCI_COMPAT_H
 
@@ -15,6 +15,14 @@
   static __inline void mvci_mutex_lock(mvci_mutex_t *m)    { EnterCriticalSection(m); }
   static __inline void mvci_mutex_unlock(mvci_mutex_t *m)  { LeaveCriticalSection(m); }
   static __inline void mvci_mutex_destroy(mvci_mutex_t *m) { DeleteCriticalSection(m); }
+
+  /* Condition variable paired with an mvci_mutex_t. Wait releases the mutex
+   * while blocked and re-acquires it before returning; wake-ups may be
+   * spurious, so callers re-test their predicate. */
+  typedef CONDITION_VARIABLE mvci_cond_t;
+  static __inline void mvci_cond_init(mvci_cond_t *c) { InitializeConditionVariable(c); }
+  static __inline void mvci_cond_wait(mvci_cond_t *c, mvci_mutex_t *m) { SleepConditionVariableCS(c, m, INFINITE); }
+  static __inline void mvci_cond_broadcast(mvci_cond_t *c) { WakeAllConditionVariable(c); }
 
   static __inline void     mvci_sleep_ms(int ms) { Sleep((DWORD)ms); }
   static __inline uint32_t mvci_now_ms(void)     { return (uint32_t)GetTickCount(); }
@@ -38,6 +46,11 @@
   static inline void mvci_mutex_lock(mvci_mutex_t *m)    { pthread_mutex_lock(m); }
   static inline void mvci_mutex_unlock(mvci_mutex_t *m)  { pthread_mutex_unlock(m); }
   static inline void mvci_mutex_destroy(mvci_mutex_t *m) { pthread_mutex_destroy(m); }
+
+  typedef pthread_cond_t mvci_cond_t;
+  static inline void mvci_cond_init(mvci_cond_t *c) { pthread_cond_init(c, NULL); }
+  static inline void mvci_cond_wait(mvci_cond_t *c, mvci_mutex_t *m) { pthread_cond_wait(c, m); }
+  static inline void mvci_cond_broadcast(mvci_cond_t *c) { pthread_cond_broadcast(c); }
 
   static inline void mvci_sleep_ms(int ms) {
       struct timespec t = { ms / 1000, (long)(ms % 1000) * 1000000L };

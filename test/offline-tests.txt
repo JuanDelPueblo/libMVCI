@@ -36,3 +36,4 @@ des_cng_fault_test|des_cng_fault_test|test/des_backend_fault_test.c src/serial.c
 des_commoncrypto_fault_test|des_commoncrypto_fault_test|test/des_backend_fault_test.c src/serial.c test/mock_io.c|MVCI_DES_USE_COMMONCRYPTO|test/fake/cc|-|gnu|fake CommonCrypto backend needs host OpenSSL
 win_io_fault_test|win_io_fault_test|test/win_io_fault_test.c|_WIN32|test/fake/win|-|posix|fake D2XX module and Windows headers
 mvci_windows_deadline_test|mvci_windows_deadline_test|test/mvci_windows_deadline_test.c src/passthru.c src/serial.c src/des.c|-|test/fake/win|clock_gettime nanosleep|gnu|public write budget includes simulated D2XX setup
+mvci_lifecycle_test|mvci_lifecycle_test|test/mvci_lifecycle_test.c src/passthru.c src/serial.c src/des.c|MVCI_TESTING|-|-|posix|public lifecycle interleavings with an interposed POSIX clock and signal watchdog
