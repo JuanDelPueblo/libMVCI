@@ -39,13 +39,14 @@ int __wrap_nanosleep(const struct timespec *t, struct timespec *remaining)
 
 static uint8_t fail_opcode;
 static int fail_as_reply;
+static int failed_write_result = -1;
 static unsigned fail_after, purges;
 int mvci_io_write(mvci_io_t *io, const uint8_t *buf, int n)
 {
     uint8_t inner[MVCI_MAX_INNER];
     int r = mvci_frame_decrypt(mock_key(), buf, (size_t)n, inner, sizeof inner);
     if (fail_after && r >= 3 && inner[2] == fail_opcode && --fail_after == 0) {
-        if (!fail_as_reply) return -1;
+        if (!fail_as_reply) return failed_write_result;
         int result = scripted_write(io, buf, n);
         scripted_purge(io);
         uint8_t rejected[8] = {2, 0, inner[2], 8};
@@ -332,6 +333,49 @@ static void test_rx_tx_and_periodic_clear(void)
     CHECK(config.Value == 0xdeadbeef && mock_frame_count() == before);
     CHECK(PassThruClose(dev) == STATUS_NOERROR);
 }
+/* Disconnect has a separate plaintext reply path, but the same ambiguity
+ * rule as ordinary commands: an incomplete write must block later commands.
+ * A failed host purge must also block already queued host records. */
+static void test_disconnect_transport_failures(void)
+{
+    static const int write_results[] = {1, -1};
+    for (unsigned i = 0; i < sizeof write_results / sizeof *write_results; i++) {
+        J2534_ULONG dev = 0, ch = open_channel(&dev);
+        failed_write_result = write_results[i];
+        fail_opcode = 2; fail_after = 1; fail_as_reply = 0;
+        CHECK(PassThruDisconnect(ch) == ERR_FAILED);
+        PASSTHRU_MSG msg = descriptor(0x01);
+        J2534_ULONG n = 1;
+        int before = mock_frame_count();
+        CHECK(PassThruWriteMsgs(ch, &msg, &n, 1000) == ERR_FAILED && n == 0);
+        CHECK(mock_frame_count() == before);
+        CHECK(PassThruIoctl(ch, CLEAR_RX_BUFFER, NULL, NULL) == STATUS_NOERROR);
+        n = 1;
+        CHECK(PassThruWriteMsgs(ch, &msg, &n, 1000) == ERR_FAILED && n == 0);
+        CHECK(mock_frame_count() == before);
+        CHECK(PassThruClose(dev) == STATUS_NOERROR);
+    }
+    failed_write_result = -1;
+    J2534_ULONG dev = 0, ch = open_channel(&dev);
+    const uint8_t payload[] = {0x48,0x6b,0x10,0x41};
+    mock_rx_record(payload, sizeof payload, 0);
+    SCONFIG config = {P3_MIN, 100};
+    SCONFIG_LIST list = {1, &config};
+    CHECK(PassThruIoctl(ch, SET_CONFIG, &list, NULL) == STATUS_NOERROR);
+    mock_purge_failure(1);
+    int before = mock_frame_count();
+    CHECK(PassThruDisconnect(ch) == ERR_FAILED);
+    PASSTHRU_MSG msg = {0};
+    J2534_ULONG n = 1;
+    CHECK(PassThruReadMsgs(ch, &msg, &n, 0) == ERR_DEVICE_NOT_CONNECTED && n == 0);
+    CHECK(mock_frame_count() == before);
+    mock_purge_failure(0);
+    CHECK(PassThruDisconnect(ch) == STATUS_NOERROR);
+    CHECK(PassThruConnect(dev, ISO9141, 0, 10400, &ch) == STATUS_NOERROR);
+    n = 1;
+    CHECK(PassThruReadMsgs(ch, &msg, &n, 0) == ERR_BUFFER_EMPTY && n == 0);
+    CHECK(PassThruClose(dev) == STATUS_NOERROR);
+}
 int main(void)
 {
     test_filter_admission();
@@ -340,6 +384,7 @@ int main(void)
     test_channel_and_device_scope();
     test_device_filter_maps_are_separate();
     test_rx_tx_and_periodic_clear();
+    test_disconnect_transport_failures();
     printf("filter/IOCTL contracts: %u checks, %u failures, 0 skips\n", checks, failures);
     return failures ? 1 : 0;
 }

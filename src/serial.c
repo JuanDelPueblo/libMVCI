@@ -653,13 +653,13 @@ int mvci_disconnect(mvci_ctx_t *ctx)
     if (!ctx->have_key || n < 0) return -1;
     mvci_mutex_lock(&ctx->lock);
     if (mvci_io_purge_rx_checked(ctx->io) != 0) {
+        ctx->rx_purge_failed = 1;
         mvci_mutex_unlock(&ctx->lock);
         return -1;
     }
+    ctx->rx_purge_failed = 0;
     int ok = -1;
-    int sent = 0;
     if (mvci_io_write(ctx->io, frame, n) == n) {
-        sent = 1;
         int got = 0;
         uint32_t deadline = mvci_now_ms() + 1000;
         while (got < (int)sizeof exp && (int32_t)(deadline - mvci_now_ms()) > 0) {
@@ -670,10 +670,11 @@ int mvci_disconnect(mvci_ctx_t *ctx)
         }
         if (got == (int)sizeof exp && memcmp(rx, exp, sizeof exp) == 0) ok = 0;
     }
-    /* A Disconnect that was sent but not answered with the exact reply has an
-     * unknown result, and a later reply can not be told from this one: the
-     * context needs Close/Open. */
-    if (sent && ok != 0) ctx->poisoned = 1;
+    /* Any attempted write without the exact reply has an unknown result.
+     * Short writes and transport errors can leave part of the command on the
+     * adapter, just as in transact_until_locked. A later reply cannot repair
+     * the ambiguity: the context needs Close/Open. */
+    if (ok != 0) ctx->poisoned = 1;
     if (ok == 0) {
         /* The exact Disconnect reply is the clean session boundary. Frames
          * queued from the old session must not reach the next one. An
