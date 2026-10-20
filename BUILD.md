@@ -129,7 +129,24 @@ repository source and runs against captured vectors or a scripted transport.
 Build each configuration in its own directory so artifacts cannot mix. The
 commands below write under `build/`, which git ignores.
 
-With CMake:
+Use the maintained check command:
+
+```sh
+tools/check-offline.sh --out-dir build/check-offline
+```
+
+It builds the native library, checks the fixed-width ABI and J2534 exports,
+and runs the supported offline regressions. It also attempts available MinGW
+cross-builds and sanitizers. Missing prerequisites are reported with reasons.
+A build or test failure is a failure, not a skip. Nothing is installed.
+
+The focused suites cover captured codec vectors, provider command sequences,
+init output refusals, thread-local diagnostics, filters and clear operations,
+read/write counts and deadlines, framing and overflow, and backend failures.
+Platform fakes test status handling without loading the proprietary runtime.
+Paced and deadline tests use a test clock on the supported host.
+
+CMake can also run the native checks:
 
 ```sh
 cmake -S . -B build/offline -DCMAKE_BUILD_TYPE=Debug
@@ -137,32 +154,15 @@ cmake --build build/offline
 ctest --test-dir build/offline --output-on-failure
 ```
 
-- `mvci_selftest` runs `mvci_test` with no arguments: captured-vector codec,
-  framing, configuration, and refusal checks.
-- `mvci_seqtest` runs the real `PassThru*` provider against `test/mock_io.c` and
-  asserts the exact adapter-command sequences. It fails on added background
-  traffic.
-
-The live harness is the same `mvci_test` binary with a port argument. Do not
-pass one in an offline run.
-
-If CMake is unavailable, the same targets compile directly on Linux:
+If CMake is unavailable, use the direct compiler path:
 
 ```sh
-mkdir -p build/manual
-cc -std=gnu11 -O2 -Wall -Wextra -Iinclude -Isrc \
-    src/serial.c src/io.c src/des.c test/mvci_test.c \
-    -lcrypto -lpthread -o build/manual/mvci_test
-./build/manual/mvci_test
-
-cc -std=gnu11 -O2 -Wall -Wextra -Iinclude -Isrc \
-    src/passthru.c src/serial.c src/des.c test/mvci_seq_test.c test/mock_io.c \
-    -lcrypto -lpthread -o build/manual/mvci_seq_test
-./build/manual/mvci_seq_test
+tools/check-offline.sh --no-cmake --out-dir build/check-direct
 ```
 
-Both commands exit nonzero on a failed check. They use the repository source
-only; do not substitute an installed provider or a vendor DLL.
+The no-argument `mvci_test` run is the codec self-test. Its port argument starts
+the live harness. Do not pass a port in an offline run or substitute an installed
+provider for the repository source.
 
 ### Windows compile and export check
 
@@ -248,20 +248,16 @@ opens the adapter by its USB description `"M-VCI"`. Live test:
   the adapter tolerates multi-second idle with zero keepalive traffic).
 - `PassThruReadMsgs` returns the device RxStatus byte unchanged (`0` = received
   data, `2` = TX echo), matching the original DLL's behaviour.
-- Wired IOCTLs: `SET_CONFIG` (uses the connected protocol id), `FIVE_BAUD_INIT`
-  (adapter-only; disconnected maps to `ERR_DEVICE_NOT_CONNECTED`), `FAST_INIT`
-  (disconnected status maps to `ERR_TIMEOUT`), `CLEAR_PERIODIC_MSGS` (sends the
-  adapter clear command), and `CLEAR_RX_BUFFER` (drops the host software queue
-  and serial receive data). `CLEAR_TX_BUFFER` and `CLEAR_MSG_FILTERS` return
-  success without sending a cable command. `CLEAR_MSG_FILTERS` does not reclaim
-  host filter ids: stopping a filter clears its device handle but the id is not
-  reused, so repeated start/stop cycles exhaust the fixed filter table. Other
-  IOCTLs return `ERR_NOT_SUPPORTED`.
-- The DES backend is an in-place `void` transform. On Windows and macOS a crypto
-  provider failure is currently ignored, and the untouched buffer is not
-  reported to the caller. The Linux path does not open a provider handle, so
-  this failure mode is specific to the Windows and macOS backends. Offline
-  builds cannot exercise either platform backend.
+- Wired IOCTLs include truthful `GET_CONFIG(LOOPBACK)`, `SET_CONFIG`,
+  `FIVE_BAUD_INIT`, `FAST_INIT`, `CLEAR_PERIODIC_MSGS`, `CLEAR_RX_BUFFER`,
+  and `CLEAR_MSG_FILTERS`. Only a connected channel can use channel IOCTLs.
+  Voltage-read IOCTLs validate device scope and return `ERR_NOT_SUPPORTED`.
+  TX clear is unsupported because no cable cancellation command is evidenced.
+  See [filter and clear contracts](docs/filter-and-clear-contracts.md).
+- Checked DES calls report CNG and CommonCrypto failures and clear failed
+  output. Frame encoding and decoding stop on a crypto failure. The existing
+  void DES wrappers remain available but discard the result; new callers
+  should use the checked calls. Native fake-backend tests cover this host logic.
 - `PassThruSetProgrammingVoltage` supports only Pin 15 `SHORT_TO_GROUND`
   (`0xFFFFFFFE`). All other pin/value pairs return `ERR_NOT_SUPPORTED`. No
   positive voltage exists.

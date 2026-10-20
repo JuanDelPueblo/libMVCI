@@ -39,7 +39,7 @@ implementation, and a documented command sequence is not proof that the cable
 firmware applies the requested behavior.
 
 - ✅ **ISO14230 / KWP2000 (K‑line)** — connect, message filters, `SET_CONFIG`,
-  five‑baud/fast‑init, and single‑message request/response are implemented. The
+  five‑baud/fast‑init, and synchronous request/response are implemented. The
   emitted command sequences are checked against captured vectors by the
   hardware‑free sequence test. A stationary vehicle read session completed over
   this path.
@@ -49,17 +49,17 @@ firmware applies the requested behavior.
   use the connected `ProtocolID`. Offline receive tests cover queued replies
   around write acknowledgements.
 - ⬜ **ISO15765 / CAN** — not implemented. CAN ECUs are not reachable.
-- ⚠️ **J2534 API coverage is partial** — message batching, per‑message fields,
-  timeout semantics, filter lifecycle, and session isolation are not yet
-  conformant at this revision. See [Known limitations](#known-limitations).
+- **J2534 API coverage is partial.** Synchronous write batches use one caller
+  deadline and report the completed adapter ACK count. Queue-only writes,
+  unsupported flags and mismatched message protocols are refused.
 - **Configuration read-back** — `GET_CONFIG` reports only the host‑enforced
   `LOOPBACK` delivery policy. Cable timing parameters return `ERR_NOT_SUPPORTED`,
   even after a successful `SET_CONFIG`. A cable ACK does not prove that its
   firmware applies the requested timing. See [configuration limits](docs/PROTOCOL.md#configuration-read-back).
 - The wire framing (DES‑based) and session handling are implemented once and
   shared across platforms; only the protocol/transport/crypto *backends* differ
-  per OS, selected at compile time. Backend failures are not yet propagated on
-  every platform (see [Known limitations](#known-limitations)).
+  per OS, selected at compile time. Crypto failures stop frame construction or
+  decoding. Platform runtime behavior still needs separate validation.
 
 ## Known limitations
 
@@ -67,35 +67,34 @@ These are facts about the current source, not a conformance claim. Offline
 tests run the public API against a scripted transport. They do not prove
 physical timing, electrical behavior, or ECU acceptance.
 
-- **Device results are not always checked.** The connect, write, filter, and
-  programming-voltage paths match the reply opcode but do not yet reject a
-  nonzero device result byte. `PassThruGetLastError` can still describe an
-  earlier failure after a later success.
-- **Write path.** `PassThruWriteMsgs` sends one message per call and sets the
-  count to one on success. On failure the caller's count is left unchanged.
-  `TxFlags`, the message `ProtocolID`, and `TimeInterval` are ignored, and a
-  zero timeout still waits for the adapter acknowledgement (about one second).
-- **Read path.** Reads poll with a 200 ms slice, so a zero timeout can still
-  block for up to one slice. A timed read that collects some but not all
-  requested messages returns success, and every delivered message has
-  `Timestamp` zero.
-- **Session isolation.** A second `PassThruConnect` on an opened device returns
-  the same channel id. Queued receive frames can survive a disconnect, and a
-  stale acknowledgement for the same opcode can satisfy a later command.
-- **Filters.** `PassThruStartMsgFilter` always programs a one‑byte pass filter;
-  block and flow‑control types are not encoded. `CLEAR_MSG_FILTERS` returns
-  success without sending a cable command or reclaiming host filter ids, so
-  repeated start/stop cycles exhaust the fixed filter table.
-- **Framing.** A corrupt device frame can surface as an empty receive buffer
-  rather than a framing error, and an unexpected large asynchronous frame can
-  disturb acknowledgement matching.
-- **Crypto backend errors.** The DES helpers are `void` in‑place transforms. On
-  Windows (CNG) and macOS (CommonCrypto) the current code ignores a provider
-  failure and leaves the buffer unchanged, so a failed backend operation is not
-  reported to the caller.
-- **Unsupported capabilities are refused, not emulated.** ISO15765/CAN, periodic
-  messages, battery‑voltage read, wake patterns other than `FAST_INIT`, and
-  positive programming voltage return `ERR_NOT_SUPPORTED`.
+- **Acknowledgements have no sequence field.** Supported status replies require
+  a zero result byte. An already-buffered orphan ACK or a missing result stops
+  later commands. Close and reopen after ambiguous ordering. An arbitrarily
+  delayed duplicate from a completed command can still resemble a later reply;
+  this is unresolved. An adapter ACK does not establish physical transmission
+  or ECU acceptance.
+- **Write path.** A batch is validated before sending. Nonzero-timeout writes
+  complete synchronously. A zero timeout returns `ERR_NOT_SUPPORTED` with count
+  zero because no asynchronous TX queue is implemented. Counts describe adapter
+  ACKs. Payload admission remains limited to 64 bytes.
+- **Read path.** A zero timeout drains buffered input without a cable poll. A
+  timed partial batch returns `ERR_TIMEOUT` and the actual count. Corruption,
+  transport loss and queue overflow are errors. The pending queue holds 16
+  records, and receive payloads are limited to 64 bytes. Adapter timestamps are
+  not established; no timestamp is synthesized from an assumed cable clock.
+- **Filters and clear operations.** Only one-byte PASS filters are supported.
+  BLOCK, FLOW_CONTROL, longer descriptors and unsupported flags are refused.
+  Stopping a filter frees its slot. Filter clear uses individual stop commands
+  and retains failed entries. TX clear is unsupported. RX clear covers only
+  host state and serial input, and reports a host purge failure. See
+  [filter and clear contracts](docs/filter-and-clear-contracts.md).
+- **Platform validation.** Host-side fakes cover CNG, CommonCrypto and D2XX
+  status handling. Cross-compilation checks Windows ABI and exports. These
+  checks do not prove the real Windows or macOS runtimes, USB timing, or cable
+  electrical behavior.
+- **Unsupported capabilities are refused.** ISO15765/CAN, periodic transmission,
+  battery-voltage reads, pattern-only init and positive programming voltage
+  remain unsupported. The provider models one channel per open device.
 
 ## Hardware
 
@@ -111,12 +110,10 @@ The library's own identity is its file name (`libMVCI.so`, `libMVCI.dylib`,
 identified by the FTDI VID/PID and USB product description on Windows, or by the
 serial node on Linux and macOS.
 
-`PassThruReadVersion` returns fixed compatibility labels: firmware
-`J2534 MINIV1.03`, DLL `MVCI J2534 DLL v1.4.6`, API `04.04`. Hosts use these
-labels to recognize the adapter family. The library does **not** query the
-cable for a firmware build and cannot measure it; the documented command set has
-no firmware‑version request. Do not read the reported firmware string as a
-measurement of the connected device.
+`PassThruReadVersion` reports firmware `Unknown (not queried)`, DLL
+`libMVCI 1.0.0`, and API `04.04`. The firmware string is not a measurement.
+The supported command set has no evidenced firmware-version request.
+`PassThruGetLastError` reports a bounded string for the calling thread.
 
 ## Building
 
@@ -127,10 +124,10 @@ another CMake project.
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
-ctest --test-dir build            # codec + provider sequence tests, no hardware
+ctest --test-dir build            # supported offline regressions, no hardware
 ```
 
-Both offline tests and the hardware‑free compile commands are described in
+The offline tests and hardware‑free verification command are described in
 [BUILD.md](BUILD.md#verification-without-hardware). Passing them does not prove
 physical cable timing or ECU acceptance.
 

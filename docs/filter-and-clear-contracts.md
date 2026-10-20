@@ -38,8 +38,9 @@ cannot substitute for a channel ID, or a channel ID for a device ID.
 - `CLEAR_RX_BUFFER` clears the software receive queue and requests the host
   serial input purge through the existing session helper. It sends no cable
   command. It does not guarantee that a cable mailbox is empty or that later
-  polling cannot deliver a message already held by the cable. The current
-  transport purge API does not report OS purge failures.
+  polling cannot deliver a message already held by the cable. A
+  host purge failure returns an error and blocks reads and commands until a
+  successful clear. RX clear never clears ambiguous transaction ordering.
 - `CLEAR_TX_BUFFER` returns `ERR_NOT_SUPPORTED`. There is no driver TX queue
   or evidenced cable cancellation command. An ACK for a prior write does not
   prove that the cable has finished transmission. No cancellation, mailbox

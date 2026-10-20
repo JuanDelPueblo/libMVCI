@@ -29,9 +29,9 @@ the USB VID/PID and product description, the serial node on Linux and macOS, and
 the per‑connection handshake challenge. A firmware build label seen in a capture
 belongs to that capture.
 
-The J2534 `PassThruReadVersion` export returns fixed compatibility labels, not
-values read from the adapter. Do not treat those labels as a measured firmware
-identity, and do not infer cable capabilities from them.
+The J2534 `PassThruReadVersion` export reports firmware `Unknown (not queried)`,
+DLL `libMVCI 1.0.0`, and API `04.04`. These are host implementation labels. Do
+not infer the connected firmware build or cable capabilities from them.
 
 ## 2. Frame format
 
@@ -182,11 +182,19 @@ After decryption, replies take one of two forms.
 ### 6.1 Status reply
 
 ```
-02 00 <CMD> 00 00 00 00 <status>          (8 bytes, 1 block)
+02 00 <CMD> <result> <opaque bytes x 4>   (8 bytes, 1 block)
 ```
 
-`<CMD>` echoes the command being acknowledged; `<status>` is a result byte.
-Checksummed over the encrypted payload (§2.1).
+`<CMD>` echoes the command opcode. The provider accepts supported generic ACKs
+only when offset 3 is zero. It refuses nonzero results without guessing a
+status-code map. This shared result layout is STRONG_INFERENCE from the
+captured configuration and stop replies; complete captured success examples
+are not available here for every opcode. Scripted fixtures are not cable proof.
+
+Offset 7 is opaque (UNKNOWN), not a result byte. Captured successful replies
+can end in `28` or `B8`. Initialization data and empty read polls have separate
+classifiers; do not apply the generic zero-result rule to them. Status replies
+use the checksum over the encrypted payload (§2.1).
 
 ### 6.2 Message reply (read poll / fast init)
 
@@ -238,19 +246,32 @@ evidenced read command is required before adding timing read-back support.
 
 ### Receive queue handling
 
-Do not flush the serial receive buffer before each transaction. A complete
-message may already be waiting, or may precede the acknowledgement for a
-different command. The session matches acknowledgements by command opcode,
-stores up to 16 intervening message replies, and delivers them once through
-the next read. Malformed replies, unrelated command replies, and queue
-overflow fail the transaction. One deadline covers the transaction's reads.
+The session decodes each frame into the full wire buffer before it matches a
+command reply. It preserves up to 16 intervening diagnostic records, each with
+an admitted payload of 1 to 64 bytes. It retains partial frames across
+nonblocking reads. Malformed frames, unrelated command replies and overflow
+are explicit errors; they do not become empty buffers.
 
-`CLEAR_RX_BUFFER` explicitly clears this software queue and the host serial
-receive buffer. It sends no adapter or vehicle command. Clearing an unread
-mailbox inside the adapter is not implemented or claimed; its vendor wire
-transaction still needs evidence. Offline native-provider tests reproduce
-messages arriving before and after a write ACK. These tests do not establish
-that this ordering caused the observed vehicle timeout.
+One caller deadline covers timed read/write batches, including waiting for the
+I/O owner and transport writes. `NumMsgs` counts delivered records or completed
+adapter ACKs. A timed partial batch returns `ERR_TIMEOUT` with its actual count.
+A zero-timeout read drains host-buffered input without issuing a poll.
+Queue-only writes (`Timeout=0`) return `ERR_NOT_SUPPORTED` and count zero.
+
+The wire has no sequence field and `0E` replies do not echo the subfunction.
+Preflight rejects buffered orphan ACKs before sending a new command. A missing
+result or ambiguous framing blocks later commands until Close/Open. A purge or
+quiet interval cannot establish recovery. Arbitrarily delayed duplicates from
+already-completed commands remain indistinguishable if they arrive during a
+later command with the same reply opcode. No deterministic recovery or physical
+ACK latency bound is claimed.
+
+`CLEAR_RX_BUFFER` purges the host serial input before it drops the software
+queue and partial frame. If the host purge fails, the call fails and reads and
+commands are blocked until a successful clear. Clearing RX never clears an
+ambiguous-transaction latch. It sends no adapter or vehicle command and does
+not guarantee that the cable mailbox is empty. An adapter ACK does not prove
+bus transmission or ECU acceptance.
 
 ### 6.3 Proven command construction vs adapter-only failures
 
