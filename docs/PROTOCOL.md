@@ -8,6 +8,11 @@ All multi‑byte integers are **little‑endian** unless noted. Byte values are
 hexadecimal. "Inner" refers to a decrypted command/response body; "frame" refers
 to the bytes actually on the wire.
 
+This document records the protocol as observed and implemented. It is not a
+claim of J2534 conformance, firmware capability, or electrical behavior. The
+[README status](../README.md#status) lists the current API coverage and
+limitations.
+
 ---
 
 ## 1. Link layer
@@ -16,6 +21,17 @@ to the bytes actually on the wire.
 - Serial line: **115200 baud, 8 data bits, no parity, 1 stop bit**, no flow control.
 - **MCU reset on open:** clear RTS, set DTR, wait 15 ms, clear DTR; then wait
   ~1 s for the adapter to boot before the first frame.
+
+### 1.1 Identity and firmware version
+
+The proven command set has no firmware‑version query. The host observes only
+the USB VID/PID and product description, the serial node on Linux and macOS, and
+the per‑connection handshake challenge. A firmware build label seen in a capture
+belongs to that capture.
+
+The J2534 `PassThruReadVersion` export returns fixed compatibility labels, not
+values read from the adapter. Do not treat those labels as a measured firmware
+identity, and do not infer cable capabilities from them.
 
 ## 2. Frame format
 
@@ -117,7 +133,7 @@ denotes a little‑endian field.
 | Set config (one param) | `0E`/`02` | `0E 00 0E 02` `[proto u32]` `[param u32]` `[value u32]` | status `02 00 0E` |
 | Clear periodic msgs | `0E`/`09` | `06 00 0E 09` `[proto u32]` | status `02 00 0E` |
 | Fast init | `0E`/`05` | `ILEN 00 0E 05` `[proto u32]` `init bytes…` | message reply (ECU key bytes), or status §6.3 |
-| Five-baud init | `0E`/`04` | `ILEN 00 0E 04` `[proto u32]` `address bytes…` | status §6.3; Corolla success shape below |
+| Five-baud init | `0E`/`04` | `ILEN 00 0E 04` `[proto u32]` `address bytes…` | status §6.3; ISO9141 success shape below |
 | Prog voltage | `0D` | `09 00 0D` `[pin u32]` `[voltage u32]` | status `02 00 0D` |
 | Write message | `0A` | `0E 00 0A` `[proto u32]` `[flags u32]` `msg bytes…` | status `02 00 0A` |
 | Read poll | `09` | `05 00 09` `[proto u32]` `00` | message reply, or empty status |
@@ -127,11 +143,13 @@ denotes a little‑endian field.
 Notes:
 - **Filter `type`** values follow J2534: `1` = PASS, `2` = BLOCK, `3` = FLOW_CONTROL.
 - **Set config** sends one parameter per command; J2534 parameter ids and values
-  pass through unchanged (`param`, `value`). The Corolla programming path uses
+  pass through unchanged (`param`, `value`). The captured programming path uses
   ISO9141 id 3. Example inners: `0E 00 0E 02 03 00 00 00 01 00 00 00 80 25 00 00`
   (DATA_RATE=9600), `0E 00 0E 02 03 00 00 00 0C 00 00 00 00 00 00 00` (P4_MIN=0),
   `0E 00 0E 02 03 00 00 00 14 00 00 00 46 00 00 00` (TINIL=70),
   `0E 00 0E 02 03 00 00 00 15 00 00 00 50 00 00 00` (TWUP=80).
+  The provider transmits these values, but no evidenced read command or
+  measurement shows that the cable firmware applies them.
 - **Five-baud init** builds `ILEN = 6 + address count`, then `00 0E 04`,
   the connected proto u32, and the caller address bytes. One-byte example:
   `07 00 0E 04 03 00 00 00 33`. The host pads the inner to 8, encrypts it with
@@ -143,16 +161,16 @@ Notes:
 - **Write message** `msg bytes` is the raw protocol message, e.g. an ISO14230
   request `82 <addr> F0 01 <pid>`.
 - The original KWP helper issues **Clear periodic msgs** before each Write.
-  This is not a general ISO9141 requirement: the successful Corolla rate
-  benchmark used no such call.
+  This is not a general ISO9141 requirement: the captured rate benchmark used
+  no such call.
 - The original read-poll capture used protocol 4. Its four argument bytes fit
-  the same little-endian ProtocolID field as other channel operations. A
-  Corolla session connected and wrote with protocol 3 but polled 4 and got
-  no frames. Changing only the poll argument to 3 returned the CalID and
-  333 complete timed RPM/TPS replies on 2026-10-12. The poll now uses the
-  connected ProtocolID; the protocol-4 packet stays identical to the
-  captured vector. This vehicle result covers Mini-VCI firmware 1.03 and
-  Corolla CalID `30272200`, not other protocol IDs or firmware builds.
+  the same little-endian ProtocolID field as other channel operations. One
+  vehicle session connected and wrote with protocol 3 but polled 4 and got
+  no frames. Changing only the poll argument to 3 returned data. The poll
+  therefore uses the connected ProtocolID; the protocol-4 packet stays
+  identical to the captured vector. The observation covers one captured
+  adapter build and one vehicle calibration; it does not establish other
+  protocol ids or firmware builds.
 - The vendor waits about 2000 ms before it sends the five-baud command. The
   adapter answer for one address byte took about 2670 ms with OBD disconnected.
   The host must allow at least 5000 ms for the reply.
@@ -198,12 +216,14 @@ The provider validates the whole list before it writes any output values.
 An empty list succeeds. A disconnected channel or a null parameter array for
 a nonempty list is refused. The call sends no cable command.
 
-Only `LOOPBACK` is reportable. It is a host delivery policy: `0` suppresses
-device transmit echoes; `1` forwards them unchanged. The driver never creates
-an echo from a requested write. A new channel starts at `1`, which preserves
-the earlier provider behavior. `SET_CONFIG(LOOPBACK)` accepts only `0` and `1`
-and sends no cable command. The one-byte `48` receive prefix with status `02`
-is preserved in either mode; it is not a transmit echo.
+Only `LOOPBACK` is reportable. It is a host delivery policy, not a cable
+setting: `0` suppresses device transmit echoes; `1` forwards real device echoes
+unchanged. The driver never creates an echo from a requested write, and the
+policy does not prove that the cable firmware generates echoes. A new channel
+starts at `1`, which preserves the original provider behavior.
+`SET_CONFIG(LOOPBACK)` accepts only `0` and `1` and sends no cable command. The
+one-byte `48` receive prefix with status `02` is preserved in either mode; it is
+not a transmit echo.
 
 No cable read-configuration command is evidenced. `GET_CONFIG` therefore
 returns `ERR_NOT_SUPPORTED` for every other parameter, including `DATA_RATE`,
@@ -212,7 +232,7 @@ This remains true after a `SET_CONFIG` success ACK. The provider does not
 cache requested values and label them as applied values. A nonzero cable
 status on `SET_CONFIG` returns `ERR_FAILED`.
 
-Offline tests prove these API and delivery rules. They do not show whether
+Offline tests exercise these API and delivery rules. They do not show whether
 the cable firmware applies K-line timing. A measured cable result or an
 evidenced read command is required before adding timing read-back support.
 
@@ -236,10 +256,10 @@ that this ordering caused the observed vehicle timeout.
 
 Proven construction (decrypts with the current session key, matches captures):
 
-- five-baud `07 00 0E 04 03 00 00 00 33` (T254 frame 550);
+- Five-baud `07 00 0E 04 03 00 00 00 33` (T254 frame 550);
 - Pin 15 ground `09 00 0D 0F 00 00 00 FE FF FF FF` (T255 frame 336);
-- Corolla SCONFIG inners with proto 3 (T255 frames 354/372/390/408);
-- Corolla FAST_INIT `10 00 0E 05 03 00 00 00 00 00 13 00 01 00 27 6F 57 BC`
+- Captured SCONFIG inners with proto 3 (T255 frames 354/372/390/408);
+- Captured FAST_INIT `10 00 0E 05 03 00 00 00 00 00 13 00 01 00 27 6F 57 BC`
   (T255 frame 438).
 
 Adapter-only failure replies (OBD disconnected, no ECU traffic):
@@ -247,20 +267,20 @@ Adapter-only failure replies (OBD disconnected, no ECU traffic):
 - five-baud `02 00 0E 08 00 00 00 28` maps to J2534 `ERR_DEVICE_NOT_CONNECTED (8)`.
   The host must not fabricate key bytes.
 - FAST_INIT `02 00 0E 08 00 00 00 F0` maps to J2534 `ERR_TIMEOUT (9)` with zero
-  output bytes. The prior code returned success with zero bytes. That was wrong.
+  output bytes. Zero output bytes are not success.
 - Unknown status replies fail closed. The bytes `08` and `F0`/`28` have no
   proven general meaning. Do not infer a firmware code map from them.
 
-Corolla vehicle observation, 2026-10-12, stationary with engine on:
+Vehicle observation for one ISO9141 K-line session (stationary, engine on):
 
 - `FIVE_BAUD_INIT(0x33)` on ISO9141 returned decrypted inner
   `03 00 0E 08 08 00 00 00`. The two key bytes are `08 08`. The provider
   accepts only this exact success reply and leaves other shapes fail-closed.
-- With the original protocol-4 read poll, the following functional Mode 09
-  `0903` request returned no ECU frame in four seconds. With protocol-3
-  polling, identity and the 90-second RPM/TPS benchmark completed with 333
-  valid samples and zero errors. Single-signal rate was 3.683 Hz; interleaved
-  rates were 1.858 Hz RPM and 1.825 Hz TPS under conservative host pacing.
+- With the original protocol-4 read poll, a functional Mode 09 `0903` request
+  returned no ECU frame within the allowed window. With protocol-3 polling,
+  identity reads and a sustained RPM/TPS sequence completed without a reported
+  error. This is one vehicle and one adapter build; it is not a general rate or
+  compatibility claim.
 
 ## 7. Keepalive
 

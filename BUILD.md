@@ -14,7 +14,8 @@ CMake is the single build system for every platform (Linux, macOS, Windows).
 ```
 include/mvci/   public headers      -> #include <mvci/j2534.h>, <mvci/serial.h>
 src/            sources + private headers (io.h, compat.h, mvci.def)
-test/           mvci_test.c (verification harness)
+test/           mvci_test.c (codec/live harness), mvci_seq_test.c (provider
+                sequence test), mock_io.c (scripted transport)
 cmake/          libmvciConfig.cmake.in (package config template)
 CMakeLists.txt  cross-platform build
 CMakePresets.json  win32/win64 + default build presets
@@ -33,7 +34,7 @@ external crypto dependency there.
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
-ctest --test-dir build            # runs the hardware-free codec self-test
+ctest --test-dir build            # two hardware-free tests
 ```
 
 Outputs land in `build/` (multi-config generators like Visual Studio put them in
@@ -121,6 +122,83 @@ add_custom_command(TARGET my_app POST_BUILD
 
 ---
 
+## Verification without hardware
+
+Offline targets need no adapter, provider, or vehicle. Each test builds from the
+repository source and runs against captured vectors or a scripted transport.
+Build each configuration in its own directory so artifacts cannot mix. The
+commands below write under `build/`, which git ignores.
+
+With CMake:
+
+```sh
+cmake -S . -B build/offline -DCMAKE_BUILD_TYPE=Debug
+cmake --build build/offline
+ctest --test-dir build/offline --output-on-failure
+```
+
+- `mvci_selftest` runs `mvci_test` with no arguments: captured-vector codec,
+  framing, configuration, and refusal checks.
+- `mvci_seqtest` runs the real `PassThru*` provider against `test/mock_io.c` and
+  asserts the exact adapter-command sequences. It fails on added background
+  traffic.
+
+The live harness is the same `mvci_test` binary with a port argument. Do not
+pass one in an offline run.
+
+If CMake is unavailable, the same targets compile directly on Linux:
+
+```sh
+mkdir -p build/manual
+cc -std=gnu11 -O2 -Wall -Wextra -Iinclude -Isrc \
+    src/serial.c src/io.c src/des.c test/mvci_test.c \
+    -lcrypto -lpthread -o build/manual/mvci_test
+./build/manual/mvci_test
+
+cc -std=gnu11 -O2 -Wall -Wextra -Iinclude -Isrc \
+    src/passthru.c src/serial.c src/des.c test/mvci_seq_test.c test/mock_io.c \
+    -lcrypto -lpthread -o build/manual/mvci_seq_test
+./build/manual/mvci_seq_test
+```
+
+Both commands exit nonzero on a failed check. They use the repository source
+only; do not substitute an installed provider or a vendor DLL.
+
+### Windows compile and export check
+
+A cross-compiler can verify that the Windows source set builds and exports the
+undecorated `PassThru*` names without a Windows machine:
+
+```sh
+mkdir -p build/cross-win32
+i686-w64-mingw32-gcc -std=gnu11 -O2 -Wall -Wextra -DMVCI_BUILDING_DLL \
+    -Iinclude -Isrc -shared \
+    src/passthru.c src/serial.c src/io.c src/des.c src/mvci.def \
+    -lbcrypt -o build/cross-win32/MVCI32.dll
+i686-w64-mingw32-objdump -p build/cross-win32/MVCI32.dll
+```
+
+This is a compile and export inspection, not a Windows runtime test. It does
+not exercise CNG, D2XX, or a J2534 host. MinGW may print stdcall-alias warnings
+for the exports; confirm the names in the `objdump` output.
+
+### What offline verification does not cover
+
+- Physical voltage, K-line waveforms, and measured timing.
+- Adapter compatibility beyond the fixed-width ABI and export names.
+- Windows or macOS runtime behavior of the crypto and transport backends.
+- J2534 host acceptance, ECU communication, and programming.
+
+### Reporting results
+
+Record each target as pass, fail, or not run. If CMake, a platform compiler, a
+Windows/macOS runtime, or the sanitizer runtime is absent, report the target as
+not run and name the missing tool. Do not count a skipped target as a pass. A
+failed `-fsanitize=address,undefined` link because the runtime library is
+missing is a skip, not a sanitizer result.
+
+---
+
 ## Per-platform notes
 
 All three platforms build with the CMake steps above; what differs is the
@@ -172,8 +250,18 @@ opens the adapter by its USB description `"M-VCI"`. Live test:
   data, `2` = TX echo), matching the original DLL's behaviour.
 - Wired IOCTLs: `SET_CONFIG` (uses the connected protocol id), `FIVE_BAUD_INIT`
   (adapter-only; disconnected maps to `ERR_DEVICE_NOT_CONNECTED`), `FAST_INIT`
-  (disconnected status maps to `ERR_TIMEOUT`), `CLEAR_PERIODIC_MSGS`, and the
-  buffer/filter clears (no-ops). Others return `ERR_NOT_SUPPORTED`.
+  (disconnected status maps to `ERR_TIMEOUT`), `CLEAR_PERIODIC_MSGS` (sends the
+  adapter clear command), and `CLEAR_RX_BUFFER` (drops the host software queue
+  and serial receive data). `CLEAR_TX_BUFFER` and `CLEAR_MSG_FILTERS` return
+  success without sending a cable command. `CLEAR_MSG_FILTERS` does not reclaim
+  host filter ids: stopping a filter clears its device handle but the id is not
+  reused, so repeated start/stop cycles exhaust the fixed filter table. Other
+  IOCTLs return `ERR_NOT_SUPPORTED`.
+- The DES backend is an in-place `void` transform. On Windows and macOS a crypto
+  provider failure is currently ignored, and the untouched buffer is not
+  reported to the caller. The Linux path does not open a provider handle, so
+  this failure mode is specific to the Windows and macOS backends. Offline
+  builds cannot exercise either platform backend.
 - `PassThruSetProgrammingVoltage` supports only Pin 15 `SHORT_TO_GROUND`
   (`0xFFFFFFFE`). All other pin/value pairs return `ERR_NOT_SUPPORTED`. No
   positive voltage exists.
