@@ -361,9 +361,14 @@ Open or Connect is refused instead of wrapping.
 
 ### 8.3 Recovery after an unknown result
 
-A lost or ambiguous result poisons the session. This covers a timeout with an outstanding command,
-a partial write, a malformed or desynchronised reply, an unanswered Disconnect,
-and a read poll cancelled after it was sent. A purge, quiet interval, later
+A lost or ambiguous result poisons the session. A read poll that passes a public
+read deadline or is canceled remains tracked. A later read can consume its
+reply. Another cable command waits for that reply within its own deadline
+before sending. The poll is poisoned if no reply arrives within 1000 ms of
+its send. This conservative limit has no measured cable-latency basis.
+A timeout with an outstanding non-poll command, a partial write, a malformed
+or desynchronised reply, or an unanswered Disconnect also poisons the session.
+A purge, quiet interval, later
 clean ACK, or a new Connect in the same session cannot prove recovery. Only
 Close/Open recovers. Before Connect, the provider performs a checked host RX
 purge and refuses a poisoned context; a refusal sends no cable command.
